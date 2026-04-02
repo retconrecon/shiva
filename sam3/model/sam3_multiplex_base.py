@@ -1899,21 +1899,14 @@ class Sam3MultiplexBase(Sam3VideoBase):
         ):
             from sam3.model.shiva_association_mx import associate_det_trk_botsort
             num_real_trk = len(trk_obj_ids)
-            # Pad trk_masks to max_num_objects (same as original path)
-            if trk_masks.shape[0] < self.max_num_objects:
-                padding_size = self.max_num_objects - trk_masks.shape[0]
-                trk_masks_padded = torch.cat([
-                    trk_masks,
-                    torch.zeros(padding_size, *trk_masks.shape[1:],
-                                device=trk_masks.device, dtype=trk_masks.dtype),
-                ], dim=0)
-            else:
-                trk_masks_padded = trk_masks
+            # Do NOT pad trk_masks — BoT-SORT returns tensors sized to
+            # num_real_trk, matching what _process_hotstart_gpu expects.
+            # (Padding to max_num_objects is only for _associate_det_trk_compilable)
             return associate_det_trk_botsort(
                 det_masks=det_masks,
                 det_scores=det_scores,
                 det_keep=det_keep,
-                trk_masks=trk_masks_padded,
+                trk_masks=trk_masks,
                 num_real_trk=num_real_trk,
                 trk_obj_ids=trk_obj_ids,
                 appearance_store=self._shiva_appearance_store,

@@ -42,7 +42,7 @@ def associate_det_trk_botsort(
     """
     device = det_masks.device
     N = det_masks.shape[0]
-    M = trk_masks.shape[0]  # includes padding
+    M = trk_masks.shape[0]  # num_real_trk (no padding in BoT-SORT path)
 
     # --- 1. Binarize for IoU ---
     det_binary = (det_masks > 0).clone()
