@@ -60,7 +60,7 @@ class Sam3TrackerBase(torch.nn.Module):
         # (this helps save GPU or CPU memory on very long videos for semi-supervised VOS eval, where only the first frame receives prompts)
         trim_past_non_cond_mem_for_eval=False,
         # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
-        non_overlap_masks_for_mem_enc=False,
+        non_overlap_masks_for_mem_enc=True,
         # the maximum number of object pointers from other frames in encoder cross attention
         max_obj_ptrs_in_encoder=16,
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
@@ -68,9 +68,9 @@ class Sam3TrackerBase(torch.nn.Module):
         # whether to compile all the model compoents
         compile_all_components=False,
         # select the frame with object existence
-        use_memory_selection=False,
+        use_memory_selection=True,
         # when using memory selection, the threshold to determine if the frame is good
-        mf_threshold=0.01,
+        mf_threshold=0.05,
     ):
         super().__init__()
 
