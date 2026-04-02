@@ -192,6 +192,8 @@ class VideoTrackingMultiplex(nn.Module):
         # (this helps save GPU or CPU memory on very long videos for semi-supervised VOS eval, where only the first frame receives prompts)
         trim_past_non_cond_mem_for_eval: bool = False,
         # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
+        # T33: default=False here but Sam3TrackerBase defaults to True (SHIVA Phase 0).
+        # Effective value comes from model_builder.py constructor args.
         non_overlap_masks_for_mem_enc: bool = False,
         # whether to cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
         use_obj_ptrs_in_encoder: bool = False,
@@ -2680,6 +2682,19 @@ class VideoTrackingMultiplex(nn.Module):
         return score_per_frame
 
     def frame_filter(self, output_dict, track_in_reverse, frame_idx, num_frames, r):
+        """Select memory frames by quality score for attention.
+
+        NOTE (T5/T34): This method is duplicated in Sam3TrackerBase
+        (sam3_tracker_base.py ~line 517). Changes here should be mirrored
+        there until they are extracted into a shared utility.
+
+        NOTE (T33): The defaults for use_memory_selection and mf_threshold
+        differ between Sam3TrackerBase (True/0.05) and this class (False/0.01).
+        The effective values come from model_builder.py constructor args.
+
+        T5 fix: iterate over actual existing dict keys instead of a linear
+        range scan. After memory pruning, the dict is sparse.
+        """
         if (frame_idx == 0 and not track_in_reverse) or (
             frame_idx == num_frames - 1 and track_in_reverse
         ):
@@ -2690,27 +2705,29 @@ class VideoTrackingMultiplex(nn.Module):
         )  # maximum number of pointer memory frames to consider
 
         if not track_in_reverse:
-            start = frame_idx - 1
-            end = 0
-            step = -r
             must_include = frame_idx - 1
         else:
-            start = frame_idx + 1
-            end = num_frames
-            step = r
             must_include = frame_idx + 1
 
+        non_cond = output_dict["non_cond_frame_outputs"]
+
+        # T5: iterate over actual keys (sparse-safe) instead of range(start, end, step)
+        existing_frames = sorted(non_cond.keys(), reverse=not track_in_reverse)
+
         valid_indices = []
-        for i in range(start, end, step):
-            if (
-                i not in output_dict["non_cond_frame_outputs"]
-                or "eff_iou_score" not in output_dict["non_cond_frame_outputs"][i]
-            ):
+        for i in existing_frames:
+            if not track_in_reverse and i >= frame_idx:
+                continue
+            if track_in_reverse and i <= frame_idx:
                 continue
 
-            score_per_frame = output_dict["non_cond_frame_outputs"][i]["eff_iou_score"]
+            entry = non_cond[i]
+            if "eff_iou_score" not in entry:
+                continue
 
-            if score_per_frame > self.mf_threshold:  # threshold
+            score_per_frame = entry["eff_iou_score"]
+
+            if score_per_frame > self.mf_threshold:
                 valid_indices.insert(0, i)
 
             if len(valid_indices) >= max_num - 1:

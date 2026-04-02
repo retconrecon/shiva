@@ -1171,9 +1171,9 @@ def build_sam3_multiplex_video_predictor(
         det_nms_use_iom=True,
         assoc_iou_thresh=0.1,
         new_det_thresh=0.65,
-        hotstart_delay=999999,
-        hotstart_unmatch_thresh=999999,
-        hotstart_dup_thresh=999999,
+        hotstart_delay=999999,          # effectively disabled (SHIVA uses box init, not hotstart)
+        hotstart_unmatch_thresh=999999,  # effectively disabled
+        hotstart_dup_thresh=999999,      # effectively disabled
         suppress_unmatched_only_within_hotstart=False,
         suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
         suppress_det_close_to_boundary=True,
