@@ -302,7 +302,7 @@ class Sam3BasePredictor:
             del session
             if run_gc_collect:
                 gc.collect()
-                # T7: Return freed CUDA blocks to the allocator. Without this,
+                # Return freed CUDA blocks to the allocator. Without this,
                 # reserved memory accumulates across sessions and causes OOM
                 # on sequential video processing.
                 import torch

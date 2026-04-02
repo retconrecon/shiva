@@ -365,6 +365,12 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 self.tracker.multiplex_controller.allowed_bucket_capacity
             )
 
+        # SHIVA BoT-SORT association flags (set from experiment script)
+        self.use_botsort_association = False
+        self._shiva_appearance_store = None
+        self._shiva_sentinel_status = "GREEN"
+        self._shiva_frame_pixels = None  # set per-frame before _associate_det_trk
+
     def all_gather_cpu(self, tensor_list, tensor):
         if self._dist_pg_cpu is None:
             self._init_dist_pg_cpu()
@@ -568,6 +574,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                     tracker_metadata_prev=tracker_metadata_prev,
                     tracker_states_local=tracker_states_local,
                     is_image_only=is_image_only,
+                    feature_cache=feature_cache,
                 )
             )
 
@@ -1003,6 +1010,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
         tracker_metadata_prev: Dict[str, np.ndarray],
         tracker_states_local: List[Any],
         is_image_only: bool = False,
+        feature_cache: Optional[Dict] = None,
     ):
         # initialize new metadata from previous metadata (its values will be updated later)
         with torch.profiler.record_function("initialize_tracker_metadata_new"):
@@ -1014,6 +1022,21 @@ class Sam3MultiplexBase(Sam3VideoBase):
         # Step 1: make the update plan and resolve heuristics on GPU 0
         det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
         det_scores: Tensor = det_out["scores"].float()
+        # SHIVA: store frame pixels for BoT-SORT appearance extraction
+        if self.use_botsort_association and feature_cache is not None and frame_idx in feature_cache:
+            frame_tensor = feature_cache[frame_idx][0]  # model-input tensor (normalized)
+            if frame_tensor is not None:
+                # Denormalize from model space (mean=0.5, std=0.5) to uint8 [0,255]
+                ft = frame_tensor.cpu().float()
+                if ft.ndim == 3 and ft.shape[0] in (1, 3):
+                    ft = ft.permute(1, 2, 0)  # C,H,W -> H,W,C
+                # Reverse normalization: pixel = (tensor * std + mean) * 255
+                ft = (ft * 0.5 + 0.5) * 255.0
+                ft = ft.clamp(0, 255).to(torch.uint8)
+                self._shiva_frame_pixels = ft.numpy()
+            else:
+                self._shiva_frame_pixels = None
+
         # a) match FA and SAM2 masks and find new objects
         with torch.profiler.record_function("associate_det_trk"):
             adt_result = self._associate_det_trk(
@@ -1866,6 +1889,42 @@ class Sam3MultiplexBase(Sam3VideoBase):
         new_det_thresh = (
             self.new_det_thresh if default_det_thresh is None else default_det_thresh
         )
+
+        # SHIVA: dispatch to BoT-SORT association when enabled
+        if (
+            self.use_botsort_association
+            and self._shiva_appearance_store is not None
+            and trk_masks.size(0) > 0
+            and det_masks.size(0) > 0
+        ):
+            from sam3.model.shiva_association_mx import associate_det_trk_botsort
+            num_real_trk = len(trk_obj_ids)
+            # Pad trk_masks to max_num_objects (same as original path)
+            if trk_masks.shape[0] < self.max_num_objects:
+                padding_size = self.max_num_objects - trk_masks.shape[0]
+                trk_masks_padded = torch.cat([
+                    trk_masks,
+                    torch.zeros(padding_size, *trk_masks.shape[1:],
+                                device=trk_masks.device, dtype=trk_masks.dtype),
+                ], dim=0)
+            else:
+                trk_masks_padded = trk_masks
+            return associate_det_trk_botsort(
+                det_masks=det_masks,
+                det_scores=det_scores,
+                det_keep=det_keep,
+                trk_masks=trk_masks_padded,
+                num_real_trk=num_real_trk,
+                trk_obj_ids=trk_obj_ids,
+                appearance_store=self._shiva_appearance_store,
+                frame_pixels=self._shiva_frame_pixels,
+                new_det_thresh=new_det_thresh,
+                iou_threshold_trk=iou_threshold_trk,
+                iou_threshold=iou_threshold,
+                HIGH_CONF_THRESH=HIGH_CONF_THRESH,
+                use_iom=self.use_iom_recondition,
+                sentinel_status=self._shiva_sentinel_status,
+            )
 
         assert det_masks.is_floating_point(), "float tensor expected (do not binarize)"
         assert trk_masks.is_floating_point(), "float tensor expected (do not binarize)"

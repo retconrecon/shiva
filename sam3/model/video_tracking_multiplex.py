@@ -192,7 +192,7 @@ class VideoTrackingMultiplex(nn.Module):
         # (this helps save GPU or CPU memory on very long videos for semi-supervised VOS eval, where only the first frame receives prompts)
         trim_past_non_cond_mem_for_eval: bool = False,
         # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
-        # T33: default=False here but Sam3TrackerBase defaults to True (SHIVA Phase 0).
+        # Default=False here but Sam3TrackerBase defaults to True (SHIVA).
         # Effective value comes from model_builder.py constructor args.
         non_overlap_masks_for_mem_enc: bool = False,
         # whether to cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
@@ -2405,9 +2405,11 @@ class VideoTrackingMultiplex(nn.Module):
             current_out["object_score_logits"] = object_score_logits
             iou_score = current_out["multistep_pred_ious"][-1].max(-1)[0]
             current_out["iou_score"] = iou_score
+            # Store as Python float to avoid CUDA sync on every .item() call
+            # during memory pruning's score ranking
             current_out["eff_iou_score"] = self.cal_mem_score(
                 object_score_logits, iou_score
-            )
+            ).item()
         # we need to return this for encoding new masks in the dynamic mode
         current_out["object_score_logits"] = object_score_logits
 
@@ -2684,15 +2686,15 @@ class VideoTrackingMultiplex(nn.Module):
     def frame_filter(self, output_dict, track_in_reverse, frame_idx, num_frames, r):
         """Select memory frames by quality score for attention.
 
-        NOTE (T5/T34): This method is duplicated in Sam3TrackerBase
+        NOTE: This method is duplicated in Sam3TrackerBase
         (sam3_tracker_base.py ~line 517). Changes here should be mirrored
         there until they are extracted into a shared utility.
 
-        NOTE (T33): The defaults for use_memory_selection and mf_threshold
-        differ between Sam3TrackerBase (True/0.05) and this class (False/0.01).
-        The effective values come from model_builder.py constructor args.
+        The defaults for use_memory_selection and mf_threshold differ between
+        Sam3TrackerBase (True/0.05) and this class (False/0.01). The effective
+        values come from model_builder.py constructor args.
 
-        T5 fix: iterate over actual existing dict keys instead of a linear
+        Iterates over actual existing dict keys instead of a linear
         range scan. After memory pruning, the dict is sparse.
         """
         if (frame_idx == 0 and not track_in_reverse) or (
@@ -2711,7 +2713,7 @@ class VideoTrackingMultiplex(nn.Module):
 
         non_cond = output_dict["non_cond_frame_outputs"]
 
-        # T5: iterate over actual keys (sparse-safe) instead of range(start, end, step)
+        # Iterate over actual keys (sparse-safe) instead of range(start, end, step)
         existing_frames = sorted(non_cond.keys(), reverse=not track_in_reverse)
 
         valid_indices = []

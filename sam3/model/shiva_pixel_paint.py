@@ -59,7 +59,7 @@ class ShivaPixelPaintRecovery:
 
     def build_background_model(self):
         """Build median + std background from sampled frames."""
-        # T30: sort numerically, not lexicographically (handles non-padded names)
+        # Sort numerically, not lexicographically (handles non-padded names)
         frame_files = sorted(
             (f for f in os.listdir(self.frame_dir) if f.endswith(".jpg")),
             key=lambda f: int(os.path.splitext(f)[0].lstrip("abcdefghijklmnopqrstuvwxyz_")),
@@ -86,11 +86,21 @@ class ShivaPixelPaintRecovery:
         self.bg_median = np.median(stack, axis=0)
         self.bg_std = np.maximum(np.std(stack, axis=0), 1.0)
 
+    def set_initial_areas(self, oid_to_area):
+        """Seed area estimates from frame-0 detections (e.g., bounding box areas).
+
+        Gives the outlier filter a reference point from the very first frame,
+        preventing contamination during the bootstrap window before enough
+        samples have been collected for a reliable median.
+        """
+        for oid, area in oid_to_area.items():
+            self.median_areas[oid] = float(area)
+
     def update_median_areas(self, frame_masks):
         """Feed frame masks to build per-fish running median area.
 
-        T4 fix: computes per-fish independently (no all-present gate),
-        recomputes periodically (not frozen at frame 500), filters outliers.
+        Computes per-fish independently (no all-present gate),
+        recomputes periodically (not frozen), filters outliers.
 
         Args:
             frame_masks: {oid: bool_mask} for this frame
@@ -112,6 +122,9 @@ class ShivaPixelPaintRecovery:
             # Recompute median once we have enough samples, then periodically
             if len(history) >= 30 and (len(history) <= 100 or len(history) % 50 == 0):
                 self.median_areas[oid] = float(np.median(history[-500:]))
+                # Trim to prevent unbounded growth on long videos
+                if len(history) > 1000:
+                    self._area_history[oid] = history[-500:]
 
     def update_last_centroid(self, oid, cx, cy):
         """Update last known centroid for an object (for spatial matching)."""
@@ -136,7 +149,7 @@ class ShivaPixelPaintRecovery:
     def _largest_component_centroid(mask):
         """Centroid of the largest connected component in a bool mask.
 
-        T8 fix: when non-overlap constraints carve a mask into disconnected
+        When non-overlap constraints carve a mask into disconnected
         fragments, the center-of-mass of all fragments may fall on water.
         Use the largest fragment's centroid instead.
         """
@@ -169,7 +182,7 @@ class ShivaPixelPaintRecovery:
             frame_masks: {oid: bool_mask} from tracker
             frame_bgr: BGR frame for pixel-paint. ALWAYS pass this from the
                 caller to avoid synchronous disk I/O (T9) and filename format
-                assumptions (T10). The None fallback is for backwards compat only.
+                assumptions. The None fallback is for backwards compat only.
 
         Returns:
             {oid: bool_mask} for fish needing recovery. Empty if all healthy.
@@ -196,7 +209,7 @@ class ShivaPixelPaintRecovery:
         if not missing_oids:
             return {}
 
-        # Load frame — prefer caller-provided to avoid sync I/O (T9/T10)
+        # Load frame — prefer caller-provided to avoid sync disk I/O
         if frame_bgr is None:
             logger.warning(
                 "frame_bgr=None at frame %d — falling back to disk read "
@@ -214,6 +227,17 @@ class ShivaPixelPaintRecovery:
         # Background subtraction
         not_water = self._get_not_water(gray)
 
+        # Guard against stale background model — if most of the frame is
+        # classified as foreground, the model has drifted and blob detection
+        # would produce false recovery masks
+        fg_fraction = not_water.sum() / not_water.size
+        if fg_fraction > 0.5:
+            logger.debug(
+                "Frame %d: %.0f%% foreground — background model may be stale, "
+                "skipping recovery", frame_idx, fg_fraction * 100,
+            )
+            return {}
+
         # Subtract healthy masks (with dilation to avoid edge noise)
         unclaimed = not_water.copy()
         for oid, mask in healthy_masks.items():
@@ -224,7 +248,7 @@ class ShivaPixelPaintRecovery:
             )
             unclaimed[dilated > 0] = False
 
-        # Find unclaimed blobs — use per-fish area as lower bound (T16 partial)
+        # Find unclaimed blobs — use per-fish area as lower bound
         labeled, n_comp = ndlabel(unclaimed)
         min_blob_area = self.min_fish_area // 2
         if self.median_areas:
@@ -282,7 +306,7 @@ class ShivaPixelPaintRecovery:
                 oid = missing_oids[r]
                 blob = blobs[c]
                 recoveries[oid] = blob["mask"]
-                # T18: log with cost for provenance (caller sets was_applied)
+                # Log with cost for provenance (caller sets was_applied)
                 self.recovery_log.append({
                     "frame": frame_idx,
                     "oid": oid,
