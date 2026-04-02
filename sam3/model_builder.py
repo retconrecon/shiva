@@ -1024,7 +1024,7 @@ def build_sam3_multiplex_video_model(
         condition_as_mask_input_bg=0.0,
         # Memory settings
         use_maskmem_tpos_v2=True,
-        save_image_features=False,  # SHIVA uses pixel histograms, not backbone features
+        save_image_features=True,  # Required: False triggers legacy encoder API mismatch
         randomness_fix=True,
         # Interaction settings
         use_mask_input_as_output_without_sam=True,
