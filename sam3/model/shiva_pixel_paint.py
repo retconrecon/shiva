@@ -60,10 +60,16 @@ class ShivaPixelPaintRecovery:
 
     def build_background_model(self):
         """Build median + std background from sampled frames."""
-        # Sort numerically, not lexicographically (handles non-padded names)
+        # Sort numerically — extract digits from filename, fall back to lexicographic
+        import re
+        def _numeric_key(f):
+            digits = re.findall(r'\d+', os.path.splitext(f)[0])
+            return int(digits[-1]) if digits else 0
+
         frame_files = sorted(
-            (f for f in os.listdir(self.frame_dir) if f.endswith(".jpg")),
-            key=lambda f: int(os.path.splitext(f)[0].lstrip("abcdefghijklmnopqrstuvwxyz_")),
+            (f for f in os.listdir(self.frame_dir)
+             if f.lower().endswith((".jpg", ".jpeg", ".png"))),
+            key=_numeric_key,
         )
         n_total = self.n_frames if self.n_frames else len(frame_files)
         indices = np.linspace(
@@ -232,6 +238,14 @@ class ShivaPixelPaintRecovery:
             return {}
 
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Verify resolution matches background model
+        if gray.shape != self.bg_median.shape:
+            logger.warning(
+                "Frame resolution %s != background model %s — resizing frame",
+                gray.shape, self.bg_median.shape,
+            )
+            gray = cv2.resize(gray, (self.bg_median.shape[1], self.bg_median.shape[0]))
 
         # Background subtraction
         not_water = self._get_not_water(gray)

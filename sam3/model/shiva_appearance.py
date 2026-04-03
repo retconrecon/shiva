@@ -163,3 +163,15 @@ class ShivaAppearanceStore:
         uniform = np.ones(self.n_bins, dtype=np.float64) / self.n_bins
         hist = extract_masked_histogram(mask, frame_pixels, n_bins=self.n_bins)
         return hist if hist is not None else uniform
+
+    def extract_embedding(self, mask, frame_pixels):
+        """Alias for extract_histogram with strict validation.
+
+        Provides interface compatibility with ShivaOSNetAppearanceStore.
+        Returns None on failure (matching OSNet contract for the identity
+        verifier's needs).
+        """
+        return extract_masked_histogram(
+            mask, frame_pixels, n_bins=self.n_bins,
+            min_crop_size=16, min_coverage=0.1,
+        )

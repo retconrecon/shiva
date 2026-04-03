@@ -1637,9 +1637,28 @@ class VideoTrackingMultiplex(nn.Module):
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
             # the objects come from the same video under batch size 1).
+
+            # SHIVA memory freeze: measure pre-clamping area per object so we
+            # can detect severe clamping and freeze memory for those objects
+            _pre_clamp_areas = (pred_masks_high_res > 0).flatten(1).sum(dim=1).float()
+
             pred_masks_high_res = self._apply_non_overlapping_constraints(
                 pred_masks_high_res
             )
+
+            # Detect objects whose mask was severely clamped by non-overlap
+            # (area shrank >50%). Zero their mask contribution so the memory
+            # encoder preserves their last good state instead of encoding a
+            # degraded mask that causes a feedback loop.
+            _post_clamp_areas = (pred_masks_high_res > 0).flatten(1).sum(dim=1).float()
+            _area_ratio = _post_clamp_areas / _pre_clamp_areas.clamp(min=1.0)
+            _severely_clamped = _area_ratio < 0.5  # lost >50% of area to clamping
+            if _severely_clamped.any():
+                # Zero the clamped objects' masks for memory encoding only —
+                # the output masks (for the consumer) are unchanged
+                pred_masks_high_res = pred_masks_high_res.clone()
+                pred_masks_high_res[_severely_clamped] = -10.0  # sigmoid(-10) ≈ 0
+
         if self.apply_sigmoid_to_mask_logits_for_mem_enc:
             # scale the raw mask logits with a temperature before applying sigmoid
             assert not self.binarize_mask_from_pts_for_mem_enc, (

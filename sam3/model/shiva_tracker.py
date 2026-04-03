@@ -86,6 +86,7 @@ class ShivaTracker:
                  max_recent_frames=500, max_landmark_frames=50,
                  pixel_paint_enabled=True, botsort_enabled=False,
                  identity_verification=False, appearance_backend="histogram",
+                 confidence_injection=False, confidence_threshold=0.3,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -103,6 +104,12 @@ class ShivaTracker:
             raise RuntimeError(f"Session {session_id} not found in predictor")
         self._inference_state = session["state"]
 
+        # Reset SENTINEL status from any previous session
+        self._model = predictor.model if hasattr(predictor, 'model') else None
+        if self._model is not None:
+            self._model._shiva_sentinel_status = "GREEN"
+            self._model._shiva_crossing_active = False
+
         # Initialize pixel-paint recovery
         self.pixel_paint = None
         if pixel_paint_enabled:
@@ -112,7 +119,6 @@ class ShivaTracker:
             self.pixel_paint.build_background_model()
 
         # Initialize BoT-SORT association
-        self._model = predictor.model if hasattr(predictor, 'model') else None
         self.appearance_backend = appearance_backend
         if botsort_enabled:
             if appearance_backend == "osnet":
@@ -141,6 +147,16 @@ class ShivaTracker:
             )
             logger.info("Identity verification enabled (backend: %s)",
                         getattr(_store, 'distance_metric', 'histogram'))
+
+        # Initialize confidence-triggered mask injection
+        self.injector = None
+        if confidence_injection and self.pixel_paint is not None:
+            from sam3.model.shiva_confidence_injection import ShivaConfidenceInjector
+            self.injector = ShivaConfidenceInjector(
+                predictor, session_id, self.pixel_paint,
+                confidence_threshold=confidence_threshold,
+            )
+            logger.info("Confidence injection enabled (threshold=%.2f)", confidence_threshold)
 
         self.prune_stats = []
         self._applied_swaps = set()  # deduplication for apply_swap
@@ -289,12 +305,27 @@ class ShivaTracker:
                     recovery_masks = self.pixel_paint.check_and_recover(
                         frame_idx, frame_bool, frame_bgr=frame_bgr,
                     )
+                    # Mark yielded recoveries as applied in the log
+                    if recovery_masks and self.pixel_paint.recovery_log:
+                        for entry in self.pixel_paint.recovery_log[-len(recovery_masks):]:
+                            if entry.get("frame") == frame_idx:
+                                entry["was_applied"] = True
+
                     # Update centroids from recovery blobs so spatial matching
                     # stays current during multi-frame loss events
                     for oid, rmask in recovery_masks.items():
                         cx, cy = ShivaPixelPaintRecovery._largest_component_centroid(rmask)
                         if cx is not None:
                             self.pixel_paint.update_last_centroid(oid, cx, cy)
+
+                # Confidence-triggered mid-tracking mask injection
+                # Pass recovery_masks so injector doesn't claim blobs already
+                # assigned by pixel-paint
+                if self.injector is not None:
+                    self.injector.check_and_inject(
+                        frame_idx, frame_bool, frame_bgr=frame_bgr,
+                        already_claimed=recovery_masks,
+                    )
 
                 # Identity verification — detect swaps after crossings
                 # Filter out artifact masks to prevent false crossing events
@@ -316,6 +347,12 @@ class ShivaTracker:
                             frame_idx, healthy_for_verifier, pairwise_ious,
                             frame_bgr=frame_bgr,
                         )
+                    # Signal to reconditioning gate whether any crossing is active
+                    if self._model is not None:
+                        states = self.verifier.get_crossing_states()
+                        self._model._shiva_crossing_active = any(
+                            s != "clear" for s in states.values()
+                        )
 
                 yield frame_idx, outputs, recovery_masks, swap_events
         except Exception:
@@ -333,7 +370,7 @@ class ShivaTracker:
         finally:
             gen.close()  # Idempotent — ensures deterministic cleanup on normal exit too
 
-    def apply_swap(self, oid_a, oid_b):
+    def apply_swap(self, oid_a, oid_b, frame_idx=None):
         """Atomically swap all internal state for two object IDs.
 
         Call this when the identity verifier detects a swap. Swaps:
@@ -341,17 +378,18 @@ class ShivaTracker:
         - pixel_paint.median_areas
         - pixel_paint._area_history
         - appearance_store.embeddings (if BoT-SORT enabled)
-        - identity verifier sibling pair states
 
         The consumer is still responsible for swapping its own output
         data structures (stored masks, CSV labels, etc.).
 
-        Idempotent: calling twice with the same pair is a no-op (prevents
-        accidental double-swap from undoing the correction).
+        Idempotent per (pair, frame): prevents accidental double-swap
+        within the same crossing event, but allows the same pair to
+        swap again in a later crossing.
         """
-        key = (min(oid_a, oid_b), max(oid_a, oid_b))
+        key = (min(oid_a, oid_b), max(oid_a, oid_b), frame_idx)
         if key in self._applied_swaps:
-            logger.warning("Ignoring duplicate apply_swap(%d, %d)", oid_a, oid_b)
+            logger.warning("Ignoring duplicate apply_swap(%d, %d) at frame %s",
+                           oid_a, oid_b, frame_idx)
             return
         self._applied_swaps.add(key)
 

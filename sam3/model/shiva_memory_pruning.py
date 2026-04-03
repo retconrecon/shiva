@@ -97,7 +97,11 @@ def prune_output_dict(inference_state, current_frame_idx,
             if len(keep_frames) >= max_landmark_frames:
                 break
 
-    frames_to_evict = [f for f in old_frames if f not in keep_frames]
+    # Never evict frames protected by confidence injection
+    protected = inference_state.get("_shiva_protected_frames", set())
+    frames_to_evict = [
+        f for f in old_frames if f not in keep_frames and f not in protected
+    ]
 
     if not frames_to_evict:
         return None
