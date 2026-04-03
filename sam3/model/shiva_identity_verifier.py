@@ -109,6 +109,7 @@ class ShivaIdentityVerifier:
         min_crop_size: int = 16,
         max_overlap_frames: int = 300,
         n_bins: int = None,  # defaults to SHIVA_HISTOGRAM_BINS
+        appearance_store=None,  # optional: use store's extract_embedding for swap comparison
     ):
         self.n_objects = n_objects
         self.proximity_threshold = proximity_threshold
@@ -118,6 +119,7 @@ class ShivaIdentityVerifier:
         self.max_overlap_frames = max_overlap_frames
         from sam3.model.shiva_appearance import SHIVA_HISTOGRAM_BINS
         self.n_bins = n_bins if n_bins is not None else SHIVA_HISTOGRAM_BINS
+        self._appearance_store = appearance_store
 
         # list() copies on _pair_states iteration are load-bearing —
         # notify_swap and update both mutate the dict during processing
@@ -183,11 +185,14 @@ class ShivaIdentityVerifier:
         return self._pair_states[key]
 
     def _extract_embedding(self, mask: np.ndarray, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
-        """Extract histogram embedding from masked crop.
+        """Extract embedding from masked crop.
 
-        Uses shared extract_masked_histogram with strict validation
-        (min crop size + 10% coverage).
+        Uses the active appearance store if provided (supports OSNet, histogram,
+        or any future backend). Falls back to shared extract_masked_histogram
+        with strict validation (min crop size + 10% coverage).
         """
+        if self._appearance_store is not None:
+            return self._appearance_store.extract_embedding(mask, frame_bgr)
         from sam3.model.shiva_appearance import extract_masked_histogram
         return extract_masked_histogram(
             mask, frame_bgr, n_bins=self.n_bins,
@@ -217,14 +222,18 @@ class ShivaIdentityVerifier:
 
         return True
 
-    @staticmethod
-    def _similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Histogram intersection similarity (0 = disjoint, 1 = identical).
+    def _similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute similarity using the same metric as the active appearance store.
 
-        Uses the same metric as the appearance store so thresholds are
-        on the same scale.
+        Histogram intersection for histogram backend, cosine for OSNet.
         """
-        return float(np.minimum(a, b).sum())
+        metric = getattr(self._appearance_store, 'distance_metric', 'histogram_intersection')
+        if metric == "cosine":
+            # Cosine similarity for L2-normalized embeddings
+            return float(np.dot(a, b))
+        else:
+            # Histogram intersection similarity
+            return float(np.minimum(a, b).sum())
 
     def _check_swap(
         self, pair: Tuple[int, int], bool_masks: Dict[int, np.ndarray],

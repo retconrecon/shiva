@@ -299,11 +299,19 @@ class ShivaPixelPaintRecovery:
                         (blob["cx"] - last_cent[0]) ** 2
                         + (blob["cy"] - last_cent[1]) ** 2
                     )
-                    # Normalize spatial distance (assume ~1000px frame)
-                    spatial_dist /= 500.0
+                    # Normalize by frame diagonal so matching is resolution-invariant
+                    if self.bg_median is not None:
+                        frame_diag = np.sqrt(self.bg_median.shape[0]**2 + self.bg_median.shape[1]**2)
+                    else:
+                        frame_diag = 1000.0
+                    spatial_dist /= (frame_diag / 2.0)
                 else:
                     spatial_dist = 0.0
                 cost[mi, bi] = area_dist + spatial_dist
+
+        # Guard against NaN/Inf from degenerate area/spatial values
+        if not np.isfinite(cost).all():
+            cost = np.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=0.0)
 
         row_ind, col_ind = linear_sum_assignment(cost)
 

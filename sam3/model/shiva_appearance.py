@@ -82,6 +82,8 @@ def histogram_intersection_distance(h1, h2):
 class ShivaAppearanceStore:
     """Per-track EMA appearance embeddings for identity-aware association."""
 
+    distance_metric = "histogram_intersection"  # explicit metric declaration
+
     def __init__(self, n_bins=32, ema_alpha=0.9, max_consecutive_rejects=50):
         self.n_bins = n_bins
         self.ema_alpha = ema_alpha

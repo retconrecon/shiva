@@ -68,24 +68,36 @@ def associate_det_trk_botsort(
         if trk_embs is not None:
             # Batch-transfer all detection masks to CPU in one call
             det_binary_np = det_binary.cpu().numpy()
-            uniform = np.ones(appearance_store.n_bins, dtype=np.float64) / appearance_store.n_bins
+            embed_dim = trk_embs.shape[1]
+            uniform = np.ones(embed_dim, dtype=np.float64) / max(embed_dim, 1)
             det_keep_np = det_keep.cpu().numpy()
 
+            # Extract detection embeddings (works for both histogram and OSNet)
             det_embs = []
             for i in range(N):
                 if det_keep_np[i] and det_binary_np[i].sum() > 50:
-                    hist = appearance_store.extract_histogram(det_binary_np[i], frame_pixels)
+                    emb = appearance_store.extract_histogram(det_binary_np[i], frame_pixels)
+                    det_embs.append(emb if emb is not None else uniform)
                 else:
-                    hist = uniform
-                det_embs.append(hist)
-            det_embs_np = np.stack(det_embs)  # (N, n_bins)
+                    det_embs.append(uniform)
+            det_embs_np = np.stack(det_embs)  # (N, embed_dim)
 
-            # Vectorized histogram intersection distance
+            # Distance computation — use store's declared metric
             n_real = min(num_real_trk, M)
             d_reid_np = np.ones((N, M), dtype=np.float64)
-            d_reid_np[:, :n_real] = 1.0 - np.minimum(
-                det_embs_np[:, None, :], trk_embs[None, :n_real, :]
-            ).sum(axis=2)
+
+            _metric = getattr(appearance_store, 'distance_metric', 'histogram_intersection')
+            if _metric == "cosine":
+                # Cosine distance for L2-normalized OSNet embeddings
+                d_reid_np[:, :n_real] = 1.0 - np.dot(
+                    det_embs_np, trk_embs[:n_real].T
+                )
+            else:
+                # Histogram intersection distance
+                d_reid_np[:, :n_real] = 1.0 - np.minimum(
+                    det_embs_np[:, None, :], trk_embs[None, :n_real, :]
+                ).sum(axis=2)
+
             d_reid = torch.from_numpy(d_reid_np).float().to(device)
 
     # --- 4. Fuse cost matrix ---
@@ -113,6 +125,10 @@ def associate_det_trk_botsort(
         # Build sub-cost matrix for valid dets × real tracks
         sub_cost = fused_cost[valid_det_indices[:, None],
                               torch.arange(n_real_trk, device=device)].cpu().numpy()
+
+        # Guard against NaN/Inf from degenerate masks (0/0 in IoU)
+        if not np.isfinite(sub_cost).all():
+            sub_cost = np.nan_to_num(sub_cost, nan=1.0, posinf=1.0, neginf=0.0)
 
         row_ind, col_ind = linear_sum_assignment(sub_cost)
 

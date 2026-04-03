@@ -1026,14 +1026,8 @@ class Sam3MultiplexBase(Sam3VideoBase):
         if self.use_botsort_association and feature_cache is not None and frame_idx in feature_cache:
             frame_tensor = feature_cache[frame_idx][0]  # model-input tensor (normalized)
             if frame_tensor is not None:
-                # Denormalize from model space (mean=0.5, std=0.5) to uint8 [0,255]
-                ft = frame_tensor.cpu().float()
-                if ft.ndim == 3 and ft.shape[0] in (1, 3):
-                    ft = ft.permute(1, 2, 0)  # C,H,W -> H,W,C
-                # Reverse normalization: pixel = (tensor * std + mean) * 255
-                ft = (ft * 0.5 + 0.5) * 255.0
-                ft = ft.clamp(0, 255).to(torch.uint8)
-                self._shiva_frame_pixels = ft.numpy()
+                from sam3.model.shiva_tracker import denormalize_feature_cache_to_bgr
+                self._shiva_frame_pixels = denormalize_feature_cache_to_bgr(frame_tensor)
             else:
                 self._shiva_frame_pixels = None
 
