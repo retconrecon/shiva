@@ -66,25 +66,26 @@ def associate_det_trk_botsort(
         trk_embs = appearance_store.get(real_trk_ids)
 
         if trk_embs is not None:
-            # Extract detection embeddings
+            # Batch-transfer all detection masks to CPU in one call
+            det_binary_np = det_binary.cpu().numpy()
+            uniform = np.ones(appearance_store.n_bins, dtype=np.float64) / appearance_store.n_bins
+            det_keep_np = det_keep.cpu().numpy()
+
             det_embs = []
             for i in range(N):
-                if det_keep[i]:
-                    mask_np = det_binary[i].cpu().numpy()
-                    if mask_np.sum() > 50:
-                        hist = appearance_store.extract_histogram(mask_np, frame_pixels)
-                    else:
-                        hist = np.ones(appearance_store.n_bins, dtype=np.float64) / appearance_store.n_bins
+                if det_keep_np[i] and det_binary_np[i].sum() > 50:
+                    hist = appearance_store.extract_histogram(det_binary_np[i], frame_pixels)
                 else:
-                    hist = np.ones(appearance_store.n_bins, dtype=np.float64) / appearance_store.n_bins
+                    hist = uniform
                 det_embs.append(hist)
             det_embs_np = np.stack(det_embs)  # (N, n_bins)
 
-            # Histogram intersection distance
+            # Vectorized histogram intersection distance
+            n_real = min(num_real_trk, M)
             d_reid_np = np.ones((N, M), dtype=np.float64)
-            for i in range(N):
-                for j in range(min(num_real_trk, M)):
-                    d_reid_np[i, j] = 1.0 - np.minimum(det_embs_np[i], trk_embs[j]).sum()
+            d_reid_np[:, :n_real] = 1.0 - np.minimum(
+                det_embs_np[:, None, :], trk_embs[None, :n_real, :]
+            ).sum(axis=2)
             d_reid = torch.from_numpy(d_reid_np).float().to(device)
 
     # --- 4. Fuse cost matrix ---

@@ -20,10 +20,12 @@ Usage:
     })
 
     # Track with SHIVA
-    shiva = ShivaTracker(predictor, session_id, frame_dir, n_animals=4)
-    for frame_idx, outputs, recovery_masks in shiva.track(n_frames=5000):
-        # outputs: SAM3.1 output dict (out_obj_ids, out_binary_masks, etc.)
+    shiva = ShivaTracker(predictor, session_id, frame_dir, n_animals=4,
+                         identity_verification=True)
+    for frame_idx, outputs, recovery_masks, swap_events in shiva.track(n_frames=5000):
+        # outputs: SAM3.1 output dict
         # recovery_masks: {oid: bool_mask} from pixel-paint (may be empty)
+        # swap_events: list of SwapEvent from identity verifier (may be empty)
         pass
 """
 
@@ -44,14 +46,16 @@ class ShivaTracker:
     def __init__(self, predictor, session_id, frame_dir, n_animals,
                  max_recent_frames=500, max_landmark_frames=50,
                  pixel_paint_enabled=True, botsort_enabled=False,
-                 n_frames=None):
+                 identity_verification=False, n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
         self.n_animals = n_animals
+        self.frame_dir = frame_dir
         self.max_recent_frames = max_recent_frames
         self.max_landmark_frames = max_landmark_frames
         self.pixel_paint_enabled = pixel_paint_enabled
         self.botsort_enabled = botsort_enabled
+        self.identity_verification = identity_verification
 
         # Access inference_state through predictor internals
         session = predictor._all_inference_states.get(session_id)
@@ -70,8 +74,8 @@ class ShivaTracker:
         # Initialize BoT-SORT association
         self._model = predictor.model if hasattr(predictor, 'model') else None
         if botsort_enabled:
-            from sam3.model.shiva_appearance import ShivaAppearanceStore
-            self._appearance_store = ShivaAppearanceStore(n_bins=32)
+            from sam3.model.shiva_appearance import ShivaAppearanceStore, SHIVA_HISTOGRAM_BINS
+            self._appearance_store = ShivaAppearanceStore(n_bins=SHIVA_HISTOGRAM_BINS)
             if self._model is not None:
                 self._model.use_botsort_association = True
                 self._model._shiva_appearance_store = self._appearance_store
@@ -79,16 +83,53 @@ class ShivaTracker:
             else:
                 logger.warning("Could not access predictor.model for BoT-SORT")
 
+        # Initialize identity verifier
+        self.verifier = None
+        if identity_verification:
+            from sam3.model.shiva_identity_verifier import ShivaIdentityVerifier
+            self.verifier = ShivaIdentityVerifier(n_objects=n_animals)
+            logger.info("Identity verification enabled")
+
         self.prune_stats = []
-        self._min_healthy_area = 100  # minimum mask area to count as "healthy"
+        # Derive healthy area threshold from pixel-paint so SENTINEL and
+        # pixel-paint agree on what constitutes a healthy mask
+        if self.pixel_paint is not None:
+            self._min_healthy_area = self.pixel_paint.min_fish_area
+        else:
+            self._min_healthy_area = 200
+
+        # Validate denormalization formula against disk-loaded frame 0
+        self._validate_denormalization(frame_dir)
+
+    def _validate_denormalization(self, frame_dir):
+        """One-time check that feature_cache denormalization produces valid pixels."""
+        import os
+        fc = self._inference_state.get("feature_cache")
+        if fc is None or 0 not in fc:
+            return
+        ft = fc[0][0]
+        if ft is None:
+            return
+        ft = ft.cpu().float()
+        if ft.ndim == 3 and ft.shape[0] in (1, 3):
+            ft = ft.permute(1, 2, 0)
+        denormed = (ft * 0.5 + 0.5) * 255.0
+        if denormed.min() < -50 or denormed.max() > 305:
+            logger.error(
+                "Feature cache denormalization out of range [%.1f, %.1f] — "
+                "pixel-paint and identity verification will be unreliable. "
+                "The model may use different normalization than mean=0.5, std=0.5.",
+                float(denormed.min()), float(denormed.max()),
+            )
 
     def track(self, n_frames=None, propagation_direction="forward"):
         """Run SAM3.1 propagation with SHIVA hooks.
 
         Yields:
-            (frame_idx, outputs, recovery_masks) tuples.
+            (frame_idx, outputs, recovery_masks, swap_events) tuples.
             - outputs: SAM3.1 output dict
             - recovery_masks: {oid: bool_mask} from pixel-paint, empty if healthy
+            - swap_events: list of SwapEvent from identity verifier, empty if none
         """
         request = {
             "type": "propagate_in_video",
@@ -167,9 +208,12 @@ class ShivaTracker:
                 if stats is not None:
                     self.prune_stats.append((frame_idx, stats))
 
-                # Load frame for pixel-paint recovery (avoid filename fallback)
+                # Get denormalized frame — reuse from BoT-SORT path if available,
+                # otherwise denormalize once from feature cache
                 frame_bgr = None
-                if self.pixel_paint is not None:
+                if self._model is not None and hasattr(self._model, '_shiva_frame_pixels'):
+                    frame_bgr = self._model._shiva_frame_pixels
+                if frame_bgr is None:
                     fc = self._inference_state.get("feature_cache")
                     if fc is not None and frame_idx in fc:
                         ft = fc[frame_idx][0]
@@ -177,7 +221,6 @@ class ShivaTracker:
                             ft = ft.cpu().float()
                             if ft.ndim == 3 and ft.shape[0] in (1, 3):
                                 ft = ft.permute(1, 2, 0)
-                            # Denormalize model tensor to uint8
                             ft = (ft * 0.5 + 0.5) * 255.0
                             frame_bgr = ft.clamp(0, 255).to(torch.uint8).numpy()
 
@@ -188,8 +231,37 @@ class ShivaTracker:
                     recovery_masks = self.pixel_paint.check_and_recover(
                         frame_idx, frame_bool, frame_bgr=frame_bgr,
                     )
+                    # Update centroids from recovery blobs so spatial matching
+                    # stays current during multi-frame loss events
+                    for oid, rmask in recovery_masks.items():
+                        ys, xs = np.where(rmask)
+                        if len(xs) > 0:
+                            self.pixel_paint.update_last_centroid(
+                                oid, float(xs.mean()), float(ys.mean())
+                            )
 
-                yield frame_idx, outputs, recovery_masks
+                # Identity verification — detect swaps after crossings
+                # Filter out artifact masks to prevent false crossing events
+                swap_events = []
+                if self.verifier is not None and frame_bool:
+                    healthy_for_verifier = {}
+                    for oid, m in frame_bool.items():
+                        area = int(m.sum())
+                        if self.pixel_paint is not None:
+                            median = self.pixel_paint.median_areas.get(oid)
+                            thresh = median * self.pixel_paint.area_lower if median else self._min_healthy_area
+                        else:
+                            thresh = self._min_healthy_area
+                        if area >= thresh:
+                            healthy_for_verifier[oid] = m
+                    if healthy_for_verifier:
+                        pairwise_ious = self._compute_pairwise_ious(healthy_for_verifier)
+                        swap_events = self.verifier.update(
+                            frame_idx, healthy_for_verifier, pairwise_ious,
+                            frame_bgr=frame_bgr,
+                        )
+
+                yield frame_idx, outputs, recovery_masks, swap_events
         except Exception:
             # Close the generator to trigger its finally blocks, then
             # reset session so re-propagation starts from clean state.
@@ -204,3 +276,73 @@ class ShivaTracker:
             raise
         finally:
             gen.close()  # Idempotent — ensures deterministic cleanup on normal exit too
+
+    def apply_swap(self, oid_a, oid_b):
+        """Atomically swap all internal state for two object IDs.
+
+        Call this when the identity verifier detects a swap. Swaps:
+        - pixel_paint.last_known_centroids
+        - pixel_paint.median_areas
+        - pixel_paint._area_history
+        - appearance_store.embeddings (if BoT-SORT enabled)
+        - identity verifier sibling pair states
+
+        The consumer is still responsible for swapping its own output
+        data structures (stored masks, CSV labels, etc.).
+        """
+        if self.pixel_paint is not None:
+            pp = self.pixel_paint
+            # Swap centroids
+            c_a = pp.last_known_centroids.get(oid_a)
+            c_b = pp.last_known_centroids.get(oid_b)
+            if c_a is not None:
+                pp.last_known_centroids[oid_b] = c_a
+            elif oid_b in pp.last_known_centroids:
+                del pp.last_known_centroids[oid_b]
+            if c_b is not None:
+                pp.last_known_centroids[oid_a] = c_b
+            elif oid_a in pp.last_known_centroids:
+                del pp.last_known_centroids[oid_a]
+
+            # Swap median areas
+            m_a = pp.median_areas.get(oid_a)
+            m_b = pp.median_areas.get(oid_b)
+            if m_a is not None:
+                pp.median_areas[oid_b] = m_a
+            if m_b is not None:
+                pp.median_areas[oid_a] = m_b
+
+            # Swap area history
+            h_a = pp._area_history.get(oid_a, [])
+            h_b = pp._area_history.get(oid_b, [])
+            pp._area_history[oid_a] = h_b
+            pp._area_history[oid_b] = h_a
+
+        # Swap appearance embeddings
+        if self.botsort_enabled and hasattr(self, '_appearance_store'):
+            store = self._appearance_store
+            e_a = store.embeddings.get(oid_a)
+            e_b = store.embeddings.get(oid_b)
+            if e_a is not None:
+                store.embeddings[oid_b] = e_a
+            elif oid_b in store.embeddings:
+                del store.embeddings[oid_b]
+            if e_b is not None:
+                store.embeddings[oid_a] = e_b
+            elif oid_a in store.embeddings:
+                del store.embeddings[oid_a]
+
+        logger.info("Applied swap: oid %d <-> %d", oid_a, oid_b)
+
+    @staticmethod
+    def _compute_pairwise_ious(bool_masks):
+        """Compute IoU for all (N choose 2) pairs."""
+        oids = sorted(bool_masks.keys())
+        ious = {}
+        for i in range(len(oids)):
+            for j in range(i + 1, len(oids)):
+                oi, oj = oids[i], oids[j]
+                intersection = int((bool_masks[oi] & bool_masks[oj]).sum())
+                union = int((bool_masks[oi] | bool_masks[oj]).sum())
+                ious[(oi, oj)] = float(intersection / max(union, 1))
+        return ious

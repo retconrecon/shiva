@@ -54,6 +54,7 @@ class ShivaPixelPaintRecovery:
         self._area_history = defaultdict(list)
         self._clean_count = 0
         self.recovery_log = []  # [{"frame": int, "oid": int, "blob_area": int, "cost": float}]
+        self._max_log_entries = 10000
         # Last known centroid per object — used for spatial matching in recovery
         self.last_known_centroids = last_known_centroids or {}
 
@@ -111,11 +112,19 @@ class ShivaPixelPaintRecovery:
                 continue
             history = self._area_history[oid]
 
-            # Outlier filter: reject if area changes by >2x vs running median
+            # Outlier filter: reject if area changes too much vs running median.
+            # Tighter bounds during bootstrap (first 100 samples) to prevent
+            # early identity swaps from contaminating the median.
             if history and self.median_areas.get(oid):
                 ratio = area / self.median_areas[oid]
-                if ratio > 2.5 or ratio < 0.25:
-                    continue
+                if len(history) < 100:
+                    # Strict during bootstrap
+                    if ratio > 1.5 or ratio < 0.5:
+                        continue
+                else:
+                    # Relaxed after median stabilizes
+                    if ratio > 2.5 or ratio < 0.25:
+                        continue
 
             history.append(area)
 
@@ -314,5 +323,8 @@ class ShivaPixelPaintRecovery:
                     "cost": float(cost[r, c]),
                     "was_applied": None,  # caller should set True/False
                 })
+
+        if len(self.recovery_log) > self._max_log_entries:
+            self.recovery_log = self.recovery_log[-self._max_log_entries:]
 
         return recoveries

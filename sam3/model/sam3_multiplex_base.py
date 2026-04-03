@@ -1135,6 +1135,16 @@ class Sam3MultiplexBase(Sam3VideoBase):
             and len(adt_result.trk_id_to_max_iou_high_conf_det) > 0
         )
 
+        # Gate reconditioning during identity-ambiguous periods —
+        # reconditioning uses raw IoU argmax which can override BoT-SORT's
+        # identity-aware assignment
+        if (
+            self.use_botsort_association
+            and getattr(self, '_shiva_sentinel_status', 'GREEN') != 'GREEN'
+        ):
+            should_recondition_periodic = False
+            should_recondition_iou = False
+
         # Recondition if periodic or IoU condition met
         if should_recondition_periodic or should_recondition_iou:
             adt_result = realize_adt_result(
