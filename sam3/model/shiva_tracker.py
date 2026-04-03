@@ -87,6 +87,7 @@ class ShivaTracker:
                  pixel_paint_enabled=True, botsort_enabled=False,
                  identity_verification=False, appearance_backend="histogram",
                  confidence_injection=False, confidence_threshold=0.3,
+                 occlusion_memory_freeze=False, occlusion_freeze_threshold=0.5,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -96,6 +97,8 @@ class ShivaTracker:
         self.max_landmark_frames = max_landmark_frames
         self.pixel_paint_enabled = pixel_paint_enabled
         self.botsort_enabled = botsort_enabled
+        self.occlusion_memory_freeze = occlusion_memory_freeze
+        self.occlusion_freeze_threshold = occlusion_freeze_threshold
         self.identity_verification = identity_verification
 
         # Access inference_state through predictor internals
@@ -104,11 +107,16 @@ class ShivaTracker:
             raise RuntimeError(f"Session {session_id} not found in predictor")
         self._inference_state = session["state"]
 
-        # Reset SENTINEL status from any previous session
+        # Reset SENTINEL status from any previous session and set memory freeze flags
         self._model = predictor.model if hasattr(predictor, 'model') else None
         if self._model is not None:
             self._model._shiva_sentinel_status = "GREEN"
             self._model._shiva_crossing_active = False
+            self._model.occlusion_memory_freeze = occlusion_memory_freeze
+            self._model.occlusion_freeze_threshold = occlusion_freeze_threshold
+            if occlusion_memory_freeze:
+                logger.info("Occlusion memory freeze enabled (threshold=%.2f)",
+                            occlusion_freeze_threshold)
 
         # Initialize pixel-paint recovery
         self.pixel_paint = None
@@ -198,6 +206,12 @@ class ShivaTracker:
             - recovery_masks: {oid: bool_mask} from pixel-paint, empty if healthy
             - swap_events: list of SwapEvent from identity verifier, empty if none
         """
+        # Sync memory freeze flags to model (supports setting after construction)
+        if self._model is not None:
+            for attr in ('occlusion_memory_freeze', 'occlusion_freeze_threshold'):
+                if hasattr(self, attr):
+                    setattr(self._model, attr, getattr(self, attr))
+
         request = {
             "type": "propagate_in_video",
             "session_id": self.session_id,
