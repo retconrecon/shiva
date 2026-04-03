@@ -112,11 +112,16 @@ class ShivaTracker:
         if self._model is not None:
             self._model._shiva_sentinel_status = "GREEN"
             self._model._shiva_crossing_active = False
-            self._model.occlusion_memory_freeze = occlusion_memory_freeze
-            self._model.occlusion_freeze_threshold = occlusion_freeze_threshold
+            # Memory freeze flags go on the INNER tracker model where
+            # _encode_new_memory runs, not the outer Sam3MultiplexTracking
+            _inner = self._model
+            if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+                _inner = self._model.tracker.model
+            _inner.occlusion_memory_freeze = occlusion_memory_freeze
+            _inner.occlusion_freeze_threshold = occlusion_freeze_threshold
             if occlusion_memory_freeze:
-                logger.info("Occlusion memory freeze enabled (threshold=%.2f)",
-                            occlusion_freeze_threshold)
+                logger.info("Occlusion memory freeze enabled on %s (threshold=%.2f)",
+                            type(_inner).__name__, occlusion_freeze_threshold)
 
         # Initialize pixel-paint recovery
         self.pixel_paint = None
@@ -206,11 +211,14 @@ class ShivaTracker:
             - recovery_masks: {oid: bool_mask} from pixel-paint, empty if healthy
             - swap_events: list of SwapEvent from identity verifier, empty if none
         """
-        # Sync memory freeze flags to model (supports setting after construction)
+        # Sync memory freeze flags to the INNER tracker model
         if self._model is not None:
+            _inner = self._model
+            if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+                _inner = self._model.tracker.model
             for attr in ('occlusion_memory_freeze', 'occlusion_freeze_threshold'):
                 if hasattr(self, attr):
-                    setattr(self._model, attr, getattr(self, attr))
+                    setattr(_inner, attr, getattr(self, attr))
 
         request = {
             "type": "propagate_in_video",

@@ -1657,6 +1657,9 @@ class VideoTrackingMultiplex(nn.Module):
                 _area_ratio = _post_clamp_areas / _pre_clamp_areas.clamp(min=1.0)
                 _severely_clamped = _area_ratio < _freeze_thresh
                 if _severely_clamped.any():
+                    _frozen_indices = _severely_clamped.nonzero(as_tuple=True)[0].tolist()
+                    print(f"    MEMORY FREEZE: objects {_frozen_indices} "
+                          f"(area_ratio={_area_ratio[_severely_clamped].tolist()})")
                     pred_masks_high_res = pred_masks_high_res.clone()
                     pred_masks_high_res[_severely_clamped] = -10.0
 
