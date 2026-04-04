@@ -161,64 +161,85 @@ class ShivaPixelPaintRecovery:
         return opened.astype(bool)
 
     @staticmethod
-    def complete_masks_with_foreground(frame_masks, not_water, max_dilate_px=15):
-        """Fill unclaimed foreground pixels into the nearest mask.
+    def complete_masks_with_foreground(frame_masks, not_water):
+        """Fill unclaimed foreground pixels into the nearest mask via BFS.
 
         SAM3.1's masks often don't cover thin appendages like fins. These
         unclaimed foreground pixels cause centroid displacement when the
         nearest-centroid paint rule assigns them to the wrong fish.
 
-        Algorithm: iteratively dilate each mask by 1px, claiming only
-        unclaimed foreground (not-water) pixels. Repeat until no more
-        unclaimed foreground neighbors exist or max_dilate_px is reached.
-        Each pixel goes to whichever mask reaches it first (nearest by
-        geodesic distance along the foreground).
+        Algorithm: multi-source BFS from each mask's boundary pixels into
+        unclaimed foreground. All masks expand simultaneously — each
+        unclaimed pixel goes to whichever mask boundary is closest by
+        geodesic distance along the foreground. This gives exact nearest-
+        boundary assignment (more precise than iterative dilation).
 
         Args:
             frame_masks: {oid: bool_mask} — SAM3.1 output masks
             not_water: (H, W) bool — foreground from background subtraction
-            max_dilate_px: maximum dilation radius
 
         Returns:
             {oid: bool_mask} — completed masks with fins filled in
         """
+        from collections import deque
+
         if not frame_masks or not_water is None:
             return frame_masks
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        oids = sorted(frame_masks.keys())
+        if len(oids) < 1:
+            return frame_masks
 
-        # Work on copies
-        completed = {oid: mask.copy() for oid, mask in frame_masks.items()}
+        H, W = not_water.shape
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
         # Build claimed mask (union of all fish masks)
-        claimed = np.zeros_like(not_water)
-        for mask in completed.values():
+        claimed = np.zeros((H, W), dtype=bool)
+        for mask in frame_masks.values():
             claimed |= mask
 
         # Unclaimed foreground = fish body parts not covered by any mask
         unclaimed_fg = not_water & ~claimed
 
         if not unclaimed_fg.any():
-            return completed
+            return frame_masks
 
-        for _ in range(max_dilate_px):
-            if not unclaimed_fg.any():
-                break
+        # BFS assignment map: which oid owns each unclaimed pixel (-1 = unassigned)
+        assignment = np.full((H, W), -1, dtype=np.int32)
+        bfs_queue = deque()
 
-            # Dilate each mask by 1px, claim only unclaimed foreground
-            newly_claimed = np.zeros_like(not_water)
-            for oid in completed:
-                dilated = cv2.dilate(
-                    completed[oid].astype(np.uint8), kernel
-                ).astype(bool)
-                # Claim unclaimed foreground pixels that this dilation reaches
-                can_claim = dilated & unclaimed_fg & ~newly_claimed
-                completed[oid] |= can_claim
-                newly_claimed |= can_claim
+        # Seed BFS from each mask's boundary — the edge pixels adjacent to
+        # unclaimed foreground
+        oid_to_idx = {oid: i for i, oid in enumerate(oids)}
+        for oid in oids:
+            mask_u8 = frame_masks[oid].astype(np.uint8)
+            dilated = cv2.dilate(mask_u8, kernel)
+            # Boundary = pixels in the dilation that are unclaimed foreground
+            boundary = (dilated > 0) & unclaimed_fg
+            by, bx = np.where(boundary)
+            idx = oid_to_idx[oid]
+            for pi in range(len(bx)):
+                px, py = int(bx[pi]), int(by[pi])
+                if assignment[py, px] == -1:
+                    assignment[py, px] = idx
+                    bfs_queue.append((px, py, idx))
 
-            unclaimed_fg &= ~newly_claimed
-            if not newly_claimed.any():
-                break  # No progress — remaining unclaimed isn't adjacent
+        # BFS flood — all sources expand simultaneously (FIFO = breadth-first)
+        while bfs_queue:
+            x, y, idx = bfs_queue.popleft()
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nx, ny = x + dx, y + dy
+                if (0 <= nx < W and 0 <= ny < H
+                        and unclaimed_fg[ny, nx]
+                        and assignment[ny, nx] == -1):
+                    assignment[ny, nx] = idx
+                    bfs_queue.append((nx, ny, idx))
+
+        # Build completed masks
+        completed = {}
+        for oid in oids:
+            idx = oid_to_idx[oid]
+            completed[oid] = frame_masks[oid] | (assignment == idx)
 
         return completed
 
