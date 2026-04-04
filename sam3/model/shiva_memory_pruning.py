@@ -31,6 +31,9 @@ def prune_output_dict(inference_state, current_frame_idx,
     - output_dict["non_cond_frame_outputs"] (consolidated, holds GPU tensors)
     - output_dict_per_obj[obj_idx]["non_cond_frame_outputs"] (per-object views)
 
+    Handles both direct inference states (with output_dict at top level)
+    and multiplex inference states (with output_dict inside sam2_inference_states).
+
     Keeps:
     - Last max_recent_frames frames (most recent temporal context)
     - Top max_landmark_frames by score from beyond the recent window
@@ -40,9 +43,38 @@ def prune_output_dict(inference_state, current_frame_idx,
     Returns:
         dict with pruning stats, or None if no pruning occurred.
     """
-    # --- Step 1: Determine which frames to evict using the consolidated dict ---
-    # The consolidated dict is the authoritative source — it holds the actual
-    # GPU tensors. Per-object dicts hold views into these same tensors.
+    # Multiplex path: output_dict lives inside sam2_inference_states
+    sam2_states = inference_state.get("sam2_inference_states", [])
+    if sam2_states:
+        total = {"pruned": 0, "kept_landmarks": 0, "retained_total": 0}
+        for inner_state in sam2_states:
+            result = _prune_single_state(
+                inner_state, current_frame_idx,
+                max_recent_frames, max_landmark_frames,
+            )
+            if result:
+                total["pruned"] += result["pruned"]
+                total["kept_landmarks"] = max(total["kept_landmarks"], result["kept_landmarks"])
+                total["retained_total"] = max(total["retained_total"], result["retained_total"])
+        # Periodic defragmentation (once per frame, not per inner state)
+        if total["pruned"] > 0 and current_frame_idx % 1000 == 0:
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return total if total["pruned"] > 0 else None
+
+    # Direct path: output_dict at top level
+    return _prune_single_state(
+        inference_state, current_frame_idx,
+        max_recent_frames, max_landmark_frames,
+    )
+
+
+def _prune_single_state(inference_state, current_frame_idx,
+                         max_recent_frames, max_landmark_frames):
+    """Prune a single inference state's output dicts."""
     main_non_cond = inference_state.get("output_dict", {}).get(
         "non_cond_frame_outputs", {}
     )
