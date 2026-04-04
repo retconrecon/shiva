@@ -2697,6 +2697,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                     video_height=orig_vid_height,
                     video_width=orig_vid_width,
                     num_frames=num_frames,
+                    offload_state_to_cpu=getattr(self, "_shiva_offload_state_to_cpu", False),
                 )
                 new_sam2_state["backbone_out"] = (
                     prev_sam2_state.get("backbone_out", None)
@@ -2717,6 +2718,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                         video_height=orig_vid_height,
                         video_width=orig_vid_width,
                         num_frames=num_frames,
+                        offload_state_to_cpu=getattr(self, "_shiva_offload_state_to_cpu", False),
                     )
                     new_sam2_state["backbone_out"] = None
                     tracker_states_local = [new_sam2_state]
@@ -2728,6 +2730,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                     video_height=orig_vid_height,
                     video_width=orig_vid_width,
                     num_frames=num_frames,
+                    offload_state_to_cpu=getattr(self, "_shiva_offload_state_to_cpu", False),
                 )
                 new_sam2_state["backbone_out"] = (
                     prev_sam2_state.get("backbone_out", None)

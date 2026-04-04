@@ -208,6 +208,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
@@ -232,6 +233,8 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             lazy_loading_frames=lazy_loading_frames,
         )
         inference_state = {}
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+        self._shiva_offload_state_to_cpu = offload_state_to_cpu
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
         inference_state["device"] = torch.device("cuda")
@@ -1835,6 +1838,7 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
@@ -1844,6 +1848,7 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
@@ -2218,6 +2223,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
@@ -2227,6 +2233,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
@@ -2257,6 +2264,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
     def cancel_propagation(self, inference_state):
@@ -3351,6 +3359,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
         # Step 4: Set up the singleton state structure for the extracted object
