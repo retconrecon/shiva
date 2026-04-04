@@ -198,72 +198,63 @@ class ShivaConfidenceInjector:
         return injected
 
     def _inject_mask(self, frame_idx, sam3_obj_id, mask_bool):
-        """Inject a corrected mask into SAM3.1 via add_new_masks().
+        """Inject a corrected mask into SAM3.1 and encode it into memory.
 
-        add_new_masks() sets run_mem_encoder=False, so the new entry has
-        maskmem_features=None. We preserve the original entry's memory
-        features to prevent a crash on the next frame when
-        _prepare_memory_conditioned_features tries to use them.
+        add_new_masks() stores the mask but sets run_mem_encoder=False.
+        We then manually trigger _consolidate_temp_output_across_obj with
+        run_mem_encoder=True so the corrected mask is encoded into the
+        memory bank and affects future frame predictions.
         """
         try:
-            # Snapshot existing maskmem_features before injection overwrites them
-            obj_idx_to_id = self._inference_state.get("obj_idx_to_id", {})
-            id_to_idx = {v: k for k, v in obj_idx_to_id.items()}
-            obj_idx = id_to_idx.get(sam3_obj_id)
-
-            saved_features = {}
-            if obj_idx is not None:
-                per_obj = self._inference_state.get("output_dict_per_obj", {})
-                if obj_idx in per_obj:
-                    entry = per_obj[obj_idx].get("non_cond_frame_outputs", {}).get(frame_idx)
-                    if entry is not None:
-                        for key in ("maskmem_features", "maskmem_pos_enc"):
-                            if key in entry and entry[key] is not None:
-                                saved_features[key] = entry[key]
-
             mask_tensor = torch.from_numpy(
                 mask_bool.astype(np.float32)
             ).unsqueeze(0)  # (1, H, W)
 
-            self.predictor.model.add_new_masks(
+            # Get the inner tracker model (VideoTrackingMultiplexDemo)
+            outer_model = self.predictor.model
+            inner_model = outer_model.tracker.model if (
+                hasattr(outer_model, 'tracker') and hasattr(outer_model.tracker, 'model')
+            ) else outer_model
+
+            # Step 1: inject the mask (stores in temp_output_dict, no memory encoding)
+            inner_model.add_new_masks(
                 inference_state=self._inference_state,
                 frame_idx=frame_idx,
                 obj_ids=[sam3_obj_id],
                 masks=mask_tensor,
             )
 
-            # Restore maskmem_features in BOTH per-obj and consolidated dicts
-            # so the next frame's _prepare_memory_conditioned_features doesn't
-            # crash trying to access None
-            if obj_idx is not None and saved_features:
-                # Per-obj dict
-                per_obj = self._inference_state.get("output_dict_per_obj", {})
-                if obj_idx in per_obj:
-                    entry = per_obj[obj_idx].get("non_cond_frame_outputs", {}).get(frame_idx)
-                    if entry is not None:
-                        for key, val in saved_features.items():
-                            if key not in entry or entry[key] is None:
-                                entry[key] = val
+            # Step 2: consolidate with memory encoding — this runs
+            # _apply_non_overlapping_constraints + _run_memory_encoder
+            # so the corrected mask enters the memory bank
+            batch_size = inner_model._get_obj_num(self._inference_state)
+            consolidated_out = inner_model._consolidate_temp_output_across_obj(
+                inference_state=self._inference_state,
+                frame_idx=frame_idx,
+                is_cond=False,
+                run_mem_encoder=True,
+            )
 
-                # Consolidated dict (memory attention reads from here)
-                main_dict = self._inference_state.get("output_dict", {})
-                main_entry = main_dict.get("non_cond_frame_outputs", {}).get(frame_idx)
-                if main_entry is not None:
-                    for key, val in saved_features.items():
-                        if key not in main_entry or main_entry[key] is None:
-                            main_entry[key] = val
+            # Step 3: store the consolidated output (with memory features)
+            # in the main output dict so future frames can attend to it
+            storage_key = "non_cond_frame_outputs"
+            self._inference_state["output_dict"][storage_key][frame_idx] = consolidated_out
+            # Also update per-object outputs
+            inner_model._add_output_per_object(
+                self._inference_state, frame_idx, consolidated_out, storage_key,
+            )
 
-            # Protect this frame from pruning, with a cap to prevent
-            # unbounded VRAM growth
+            # Protect this frame from pruning, with a cap
             protected = self._inference_state.setdefault("_shiva_protected_frames", set())
             protected.add(frame_idx)
             _MAX_PROTECTED = 100
             if len(protected) > _MAX_PROTECTED:
-                # Evict oldest protected frame
                 oldest = min(protected)
                 protected.discard(oldest)
 
             return True
         except Exception as e:
             logger.error("Mask injection failed at frame %d: %s", frame_idx, e)
+            import traceback
+            traceback.print_exc()
             return False

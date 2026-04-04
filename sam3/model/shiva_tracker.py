@@ -31,6 +31,7 @@ Usage:
 
 import logging
 
+import cv2
 import numpy as np
 import torch
 
@@ -88,6 +89,7 @@ class ShivaTracker:
                  identity_verification=False, appearance_backend="histogram",
                  confidence_injection=False, confidence_threshold=0.3,
                  occlusion_memory_freeze=False, occlusion_freeze_threshold=0.5,
+                 temporal_boundary_prior=0.0,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -99,6 +101,7 @@ class ShivaTracker:
         self.botsort_enabled = botsort_enabled
         self.occlusion_memory_freeze = occlusion_memory_freeze
         self.occlusion_freeze_threshold = occlusion_freeze_threshold
+        self.temporal_boundary_prior = temporal_boundary_prior
         self.identity_verification = identity_verification
 
         # Access inference_state through predictor internals
@@ -119,9 +122,13 @@ class ShivaTracker:
                 _inner = self._model.tracker.model
             _inner.occlusion_memory_freeze = occlusion_memory_freeze
             _inner.occlusion_freeze_threshold = occlusion_freeze_threshold
+            _inner.temporal_boundary_prior = temporal_boundary_prior
             if occlusion_memory_freeze:
                 logger.info("Occlusion memory freeze enabled on %s (threshold=%.2f)",
                             type(_inner).__name__, occlusion_freeze_threshold)
+            if temporal_boundary_prior > 0:
+                logger.info("Temporal boundary prior enabled on %s (alpha=%.1f)",
+                            type(_inner).__name__, temporal_boundary_prior)
 
         # Initialize pixel-paint recovery
         self.pixel_paint = None
@@ -216,7 +223,8 @@ class ShivaTracker:
             _inner = self._model
             if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
                 _inner = self._model.tracker.model
-            for attr in ('occlusion_memory_freeze', 'occlusion_freeze_threshold'):
+            for attr in ('occlusion_memory_freeze', 'occlusion_freeze_threshold',
+                        'temporal_boundary_prior'):
                 if hasattr(self, attr):
                     setattr(_inner, attr, getattr(self, attr))
 
@@ -249,6 +257,27 @@ class ShivaTracker:
                         m = m.cpu().numpy()
                     m = m.squeeze().astype(bool)
                     frame_bool[oid] = m
+
+                # Get denormalized frame early — needed for mask completion
+                frame_bgr = None
+                if self._model is not None and hasattr(self._model, '_shiva_frame_pixels'):
+                    frame_bgr = self._model._shiva_frame_pixels
+                if frame_bgr is None:
+                    fc = self._inference_state.get("feature_cache")
+                    if fc is not None and frame_idx in fc:
+                        ft = fc[frame_idx][0]
+                        if ft is not None:
+                            frame_bgr = denormalize_feature_cache_to_bgr(ft)
+
+                # Complete masks by filling unclaimed foreground (fins, appendages)
+                # into the nearest mask. This prevents centroid displacement from
+                # unclaimed body parts and eliminates fin-color flashing.
+                if self.pixel_paint is not None and frame_bgr is not None and frame_bool:
+                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    not_water = self.pixel_paint._get_not_water(gray)
+                    frame_bool = ShivaPixelPaintRecovery.complete_masks_with_foreground(
+                        frame_bool, not_water,
+                    )
 
                 # Seed area fingerprints from first frame's masks so the
                 # outlier filter has a reference point during bootstrap
@@ -308,17 +337,7 @@ class ShivaTracker:
                 if stats is not None:
                     self.prune_stats.append((frame_idx, stats))
 
-                # Get denormalized frame — reuse from BoT-SORT path if available,
-                # otherwise denormalize once from feature cache
-                frame_bgr = None
-                if self._model is not None and hasattr(self._model, '_shiva_frame_pixels'):
-                    frame_bgr = self._model._shiva_frame_pixels
-                if frame_bgr is None:
-                    fc = self._inference_state.get("feature_cache")
-                    if fc is not None and frame_idx in fc:
-                        ft = fc[frame_idx][0]
-                        if ft is not None:
-                            frame_bgr = denormalize_feature_cache_to_bgr(ft)
+                # frame_bgr already computed above (before mask completion)
 
                 # Pixel-paint recovery
                 recovery_masks = {}

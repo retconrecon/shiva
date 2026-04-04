@@ -161,6 +161,68 @@ class ShivaPixelPaintRecovery:
         return opened.astype(bool)
 
     @staticmethod
+    def complete_masks_with_foreground(frame_masks, not_water, max_dilate_px=15):
+        """Fill unclaimed foreground pixels into the nearest mask.
+
+        SAM3.1's masks often don't cover thin appendages like fins. These
+        unclaimed foreground pixels cause centroid displacement when the
+        nearest-centroid paint rule assigns them to the wrong fish.
+
+        Algorithm: iteratively dilate each mask by 1px, claiming only
+        unclaimed foreground (not-water) pixels. Repeat until no more
+        unclaimed foreground neighbors exist or max_dilate_px is reached.
+        Each pixel goes to whichever mask reaches it first (nearest by
+        geodesic distance along the foreground).
+
+        Args:
+            frame_masks: {oid: bool_mask} — SAM3.1 output masks
+            not_water: (H, W) bool — foreground from background subtraction
+            max_dilate_px: maximum dilation radius
+
+        Returns:
+            {oid: bool_mask} — completed masks with fins filled in
+        """
+        if not frame_masks or not_water is None:
+            return frame_masks
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        # Work on copies
+        completed = {oid: mask.copy() for oid, mask in frame_masks.items()}
+
+        # Build claimed mask (union of all fish masks)
+        claimed = np.zeros_like(not_water)
+        for mask in completed.values():
+            claimed |= mask
+
+        # Unclaimed foreground = fish body parts not covered by any mask
+        unclaimed_fg = not_water & ~claimed
+
+        if not unclaimed_fg.any():
+            return completed
+
+        for _ in range(max_dilate_px):
+            if not unclaimed_fg.any():
+                break
+
+            # Dilate each mask by 1px, claim only unclaimed foreground
+            newly_claimed = np.zeros_like(not_water)
+            for oid in completed:
+                dilated = cv2.dilate(
+                    completed[oid].astype(np.uint8), kernel
+                ).astype(bool)
+                # Claim unclaimed foreground pixels that this dilation reaches
+                can_claim = dilated & unclaimed_fg & ~newly_claimed
+                completed[oid] |= can_claim
+                newly_claimed |= can_claim
+
+            unclaimed_fg &= ~newly_claimed
+            if not newly_claimed.any():
+                break  # No progress — remaining unclaimed isn't adjacent
+
+        return completed
+
+    @staticmethod
     def _largest_component_centroid(mask):
         """Centroid of the largest connected component in a bool mask.
 

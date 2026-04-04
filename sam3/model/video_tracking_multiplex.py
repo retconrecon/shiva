@@ -2628,20 +2628,59 @@ class VideoTrackingMultiplex(nn.Module):
         """
         Apply non-overlapping constraints to the object scores in pred_masks. Here we
         keep only the highest scoring object at each spatial location in pred_masks.
+
+        When temporal_boundary_prior is enabled, contested boundary pixels
+        (where the top two objects' scores are within the prior margin) are
+        resolved in favor of the previous frame's winner. This prevents
+        boundary flickering between frames without affecting uncontested regions.
         """
         batch_size = pred_masks.size(0)
         if batch_size == 1:
             return pred_masks
 
         device = pred_masks.device
+
+        # Temporal boundary prior: add a small bonus to the previous frame's
+        # winner at each pixel. At contested boundaries (scores nearly tied),
+        # this stabilizes the assignment. At uncontested regions, the bonus
+        # doesn't change the winner.
+        _prior_alpha = getattr(self, 'temporal_boundary_prior', 0.0)
+        _prev = getattr(self, '_prev_non_overlap_assignment', None)
+
+        if _prior_alpha > 0 and _prev is not None:
+            # _prev is (1, 1, H, W) with object indices from the previous frame
+            # Resize if dimensions changed
+            if _prev.shape[-2:] != pred_masks.shape[-2:]:
+                _prev = torch.nn.functional.interpolate(
+                    _prev.float(), size=pred_masks.shape[-2:],
+                    mode="nearest",
+                ).long()
+            # Build a one-hot prior from previous assignment
+            # and add alpha * prior to the current scores before argmax
+            if _prev.shape[-2:] == pred_masks.shape[-2:]:
+                prior_bonus = torch.zeros_like(pred_masks)
+                batch_inds = torch.arange(batch_size, device=device)[:, None, None, None]
+                prev_match = (_prev == batch_inds)  # (B, 1, H, W) bool
+                prior_bonus[prev_match.expand_as(prior_bonus)] = _prior_alpha
+                pred_masks_for_argmax = pred_masks + prior_bonus
+            else:
+                pred_masks_for_argmax = pred_masks
+        else:
+            pred_masks_for_argmax = pred_masks
+
         # "max_obj_inds": object index of the object with the highest score at each location
-        max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
+        max_obj_inds = torch.argmax(pred_masks_for_argmax, dim=0, keepdim=True)
         # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
         batch_obj_inds = torch.arange(batch_size, device=device)[:, None, None, None]
         keep = max_obj_inds == batch_obj_inds
         # suppress overlapping regions' scores below -10.0 so that the foreground regions
         # don't overlap (here sigmoid(-10.0)=4.5398e-05)
         pred_masks = torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
+
+        # Store assignment for next frame's prior
+        if _prior_alpha > 0:
+            self._prev_non_overlap_assignment = max_obj_inds.detach()
+
         return pred_masks
 
     def _compile_all_components(self):
