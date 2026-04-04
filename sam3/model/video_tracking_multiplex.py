@@ -1633,6 +1633,14 @@ class VideoTrackingMultiplex(nn.Module):
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
+        # DIAGNOSTIC: log flag state on first frame to verify propagation
+        if not getattr(self, '_shiva_diag_logged', False):
+            print(f"    [DIAG] _encode_new_memory: self={type(self).__name__}, "
+                  f"non_overlap_masks_for_mem_enc={self.non_overlap_masks_for_mem_enc}, "
+                  f"occlusion_memory_freeze={getattr(self, 'occlusion_memory_freeze', 'NOT SET')}, "
+                  f"temporal_boundary_prior={getattr(self, 'temporal_boundary_prior', 'NOT SET')}")
+            self._shiva_diag_logged = True
+
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
@@ -2637,6 +2645,13 @@ class VideoTrackingMultiplex(nn.Module):
         batch_size = pred_masks.size(0)
         if batch_size == 1:
             return pred_masks
+
+        # DIAGNOSTIC: log on first call to confirm this method is reached
+        if not getattr(self, '_shiva_nonoverlap_diag_logged', False):
+            print(f"    [DIAG] _apply_non_overlapping_constraints: self={type(self).__name__}, "
+                  f"batch_size={batch_size}, "
+                  f"temporal_boundary_prior={getattr(self, 'temporal_boundary_prior', 'NOT SET')}")
+            self._shiva_nonoverlap_diag_logged = True
 
         device = pred_masks.device
 
