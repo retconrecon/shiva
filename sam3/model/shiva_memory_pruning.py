@@ -56,8 +56,12 @@ def prune_output_dict(inference_state, current_frame_idx,
                 total["pruned"] += result["pruned"]
                 total["kept_landmarks"] = max(total["kept_landmarks"], result["kept_landmarks"])
                 total["retained_total"] = max(total["retained_total"], result["retained_total"])
+
+        # Prune outer-state caches that also accumulate per frame
+        _prune_outer_state(inference_state, current_frame_idx, max_recent_frames)
+
         # Periodic defragmentation (once per frame, not per inner state)
-        if total["pruned"] > 0 and current_frame_idx % 1000 == 0:
+        if current_frame_idx % 500 == 0:
             import gc
             import torch
             gc.collect()
@@ -166,3 +170,40 @@ def _prune_single_state(inference_state, current_frame_idx,
         "kept_landmarks": len(keep_frames),
         "retained_total": len(main_non_cond),
     }
+
+
+def _prune_outer_state(inference_state, current_frame_idx, max_recent_frames):
+    """Prune frame-indexed caches in the outer (multiplex) inference state.
+
+    These accumulate per-frame and are never cleaned up by SAM3.1:
+    - cached_frame_outputs: per-frame mask dicts (GPU tensors)
+    - tracker_metadata score/overlap/suppression dicts
+    """
+    recent_cutoff = current_frame_idx - max_recent_frames
+
+    # 1. cached_frame_outputs — stores mask tensors per frame, biggest GPU leak
+    cfo = inference_state.get("cached_frame_outputs")
+    if cfo and len(cfo) > max_recent_frames:
+        stale = [f for f in cfo if f < recent_cutoff]
+        for f in stale:
+            del cfo[f]
+
+    # 2. tracker_metadata frame-indexed dicts
+    tm = inference_state.get("tracker_metadata", {})
+
+    # obj_id_to_sam2_score_frame_wise[frame_idx] -> {obj_id: score}
+    scores_fw = tm.get("obj_id_to_sam2_score_frame_wise")
+    if scores_fw and len(scores_fw) > max_recent_frames:
+        stale = [f for f in scores_fw if f < recent_cutoff]
+        for f in stale:
+            del scores_fw[f]
+
+    # rank0_metadata sub-dicts indexed by frame
+    r0 = tm.get("rank0_metadata", {})
+
+    # suppressed_obj_ids[frame_idx] -> set
+    suppressed = r0.get("suppressed_obj_ids")
+    if suppressed and len(suppressed) > max_recent_frames:
+        stale = [f for f in suppressed if f < recent_cutoff]
+        for f in stale:
+            del suppressed[f]
