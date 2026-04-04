@@ -34,6 +34,7 @@ def load_resource_as_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    lazy_loading_frames=False,
 ):
     """
     Load video frames from either a video or an image (as a single-frame video).
@@ -87,6 +88,7 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            lazy_loading_frames=lazy_loading_frames,
         )
 
 
@@ -121,6 +123,7 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    lazy_loading_frames=False,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -147,6 +150,7 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             async_loading_frames=async_loading_frames,
+            lazy_loading_frames=lazy_loading_frames,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
         return load_video_frames_from_video_file(
@@ -169,6 +173,7 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    lazy_loading_frames=False,
 ):
     """
     Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
@@ -193,6 +198,12 @@ def load_video_frames_from_image_folder(
     img_paths = [os.path.join(image_folder, frame_name) for frame_name in frame_names]
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+    if lazy_loading_frames:
+        lazy_images = LazyVideoFrameLoader(
+            img_paths, image_size, offload_video_to_cpu, img_mean, img_std
+        )
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     if async_loading_frames:
         lazy_images = AsyncImageFrameLoader(
@@ -414,6 +425,72 @@ class AsyncImageFrameLoader:
 
     def __len__(self):
         return len(self.images)
+
+
+class LazyVideoFrameLoader:
+    """
+    Lazy frame loader that reads frames from disk on-demand and keeps only a
+    sliding window in memory.  Designed for long videos (60k+ frames) where
+    loading all frames into RAM would exceed system memory.
+
+    Implements the same __getitem__ / __len__ interface as AsyncImageFrameLoader
+    so it can be used as a drop-in replacement for inference_state["images"].
+    """
+
+    def __init__(
+        self, img_paths, image_size, offload_video_to_cpu, img_mean, img_std,
+        cache_size=500,
+    ):
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.cache_size = cache_size
+        self._cache = {}
+        self._access_order = []
+
+        # Load first frame to fill video_height / video_width
+        self.__getitem__(0)
+
+    def _load_frame(self, index):
+        img, video_height, video_width = _load_img_as_tensor(
+            self.img_paths[index], self.image_size
+        )
+        self.video_height = video_height
+        self.video_width = video_width
+        img = img.to(dtype=torch.float16)
+        img -= self.img_mean
+        img /= self.img_std
+        if not self.offload_video_to_cpu:
+            img = img.cuda()
+        return img
+
+    def __getitem__(self, index):
+        if index in self._cache:
+            return self._cache[index]
+
+        img = self._load_frame(index)
+        self._cache[index] = img
+        self._access_order.append(index)
+
+        # Evict oldest frames when cache exceeds limit
+        while len(self._cache) > self.cache_size:
+            oldest = self._access_order.pop(0)
+            self._cache.pop(oldest, None)
+
+        return img
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    @property
+    def device(self):
+        return torch.device("cpu") if self.offload_video_to_cpu else torch.device("cuda")
+
+    @property
+    def shape(self):
+        return (len(self.img_paths), 3, self.image_size, self.image_size)
 
 
 class TorchCodecDecoder:

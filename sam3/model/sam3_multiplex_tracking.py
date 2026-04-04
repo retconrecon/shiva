@@ -212,6 +212,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         # Initialize inference state (inlined from Sam3DemoMixin.init_state)
         if use_torchcodec:
@@ -228,6 +229,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            lazy_loading_frames=lazy_loading_frames,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
@@ -1837,6 +1839,7 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
@@ -1845,6 +1848,7 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            lazy_loading_frames=lazy_loading_frames,
         )
         # Initialize generator state for batched processing
         inference_state["generator_state"] = {
@@ -2218,6 +2222,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
@@ -2226,6 +2231,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            lazy_loading_frames=lazy_loading_frames,
         )
         # initialize extra states
         inference_state["action_history"] = []  # for logging user actions

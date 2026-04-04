@@ -46,6 +46,7 @@ class Sam3BasePredictor:
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
                 offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                lazy_loading_frames=request.get("lazy_loading_frames", False),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -107,11 +108,13 @@ class Sam3BasePredictor:
         resource_path,
         session_id=None,
         offload_video_to_cpu=False,
+        lazy_loading_frames=False,
     ):
         """Start a new inference session on a video directory or path."""
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            lazy_loading_frames=lazy_loading_frames,
         )
         if hasattr(self, "async_loading_frames"):
             init_kwargs["async_loading_frames"] = self.async_loading_frames
