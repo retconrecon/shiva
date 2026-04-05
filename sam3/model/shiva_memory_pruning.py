@@ -23,6 +23,9 @@ Usage:
 """
 
 
+_PRUNE_WARNING_THRESHOLD = 2000  # warn if non_cond exceeds this
+
+
 def prune_output_dict(inference_state, current_frame_idx,
                       max_recent_frames=500, max_landmark_frames=50):
     """Delete old frame entries from output dicts to bound VRAM.
@@ -83,15 +86,49 @@ _HEAVY_KEYS = ("maskmem_features", "maskmem_pos_enc", "pred_masks_high_res",
 def _prune_single_state(inference_state, current_frame_idx,
                          max_recent_frames, max_landmark_frames):
     """Prune a single inference state's output dicts."""
+    # Cap conditioning frames to prevent unbounded growth if reconditioning
+    # is re-enabled. SAM3.1's memory attention only uses max_cond_frames_in_attn
+    # (default 4) conditioning frames. Keep the most recent 8 and trim the rest.
+    _MAX_COND_FRAMES = 8
+    cond_out = inference_state.get("output_dict", {}).get("cond_frame_outputs", {})
+    if len(cond_out) > _MAX_COND_FRAMES:
+        cond_frames_sorted = sorted(cond_out.keys())
+        for f in cond_frames_sorted[:-_MAX_COND_FRAMES]:
+            cond_out.pop(f, None)
+        # Also trim from per-object cond dicts
+        for obj_idx in inference_state.get("output_dict_per_obj", {}):
+            obj_cond = (
+                inference_state["output_dict_per_obj"][obj_idx]
+                .get("cond_frame_outputs", {})
+            )
+            for f in cond_frames_sorted[:-_MAX_COND_FRAMES]:
+                obj_cond.pop(f, None)
+
     main_non_cond = inference_state.get("output_dict", {}).get(
         "non_cond_frame_outputs", {}
     )
+
+    # Safety net: warn if output_dict has grown far beyond expected bounds.
+    # This catches experiment scripts that forget to call prune_output_dict.
+    if len(main_non_cond) > _PRUNE_WARNING_THRESHOLD:
+        import logging
+        logging.getLogger(__name__).warning(
+            "non_cond_frame_outputs has %d entries (expected <%d). "
+            "Ensure prune_output_dict() is called every frame to prevent OOM.",
+            len(main_non_cond), max_recent_frames + max_landmark_frames,
+        )
 
     # Trim heavy tensors from frames beyond the memory attention window.
     # SAM3.1 only retrieves maskmem_features from the last num_maskmem (7)
     # frames. Older frames only need pred_masks + obj_ptr + scores (~90KB
     # instead of ~12MB). This is the same trim SAM3.1 does when
     # trim_past_non_cond_mem_for_eval=True, but applied unconditionally.
+    #
+    # CRITICAL: Must trim BOTH the consolidated dict AND the per-object
+    # view dicts. Per-object entries are tensor VIEWS sharing storage with
+    # the consolidated dict. Trimming only the consolidated dict removes
+    # the dict entry but the view in output_dict_per_obj still holds a
+    # reference to the underlying GPU storage, preventing deallocation.
     trim_cutoff = current_frame_idx - 8  # num_maskmem + 1 buffer
     for f in list(main_non_cond.keys()):
         if f >= trim_cutoff:
@@ -99,6 +136,18 @@ def _prune_single_state(inference_state, current_frame_idx,
         entry = main_non_cond[f]
         for key in _HEAVY_KEYS:
             entry.pop(key, None)
+    # Trim the same keys from per-object view dicts
+    for obj_idx in inference_state.get("output_dict_per_obj", {}):
+        obj_non_cond = (
+            inference_state["output_dict_per_obj"][obj_idx]
+            .get("non_cond_frame_outputs", {})
+        )
+        for f in list(obj_non_cond.keys()):
+            if f >= trim_cutoff:
+                continue
+            obj_entry = obj_non_cond[f]
+            for key in _HEAVY_KEYS:
+                obj_entry.pop(key, None)
 
     if len(main_non_cond) <= max_recent_frames + max_landmark_frames:
         return None
@@ -208,11 +257,17 @@ def _prune_outer_state(inference_state, current_frame_idx, max_recent_frames):
         for inner in inference_state.get("sam2_inference_states", []):
             cond_out = inner.get("output_dict", {}).get("cond_frame_outputs", {})
             cond_frames.update(cond_out.keys())
-        # Non-string keys only (feature_cache also stores 'tracking_bounds', 'text', etc.)
+        # Prune integer-keyed frame entries
         frame_keys = [k for k in fc if isinstance(k, int) and k < recent_cutoff]
         stale = [k for k in frame_keys if k not in cond_frames]
         for k in stale:
             del fc[k]
+        # Clear string-keyed caches that accumulate internal state
+        # (grounding_cache, multigpu_buffer — ~100-500MB each)
+        for str_key in ("grounding_cache", "multigpu_buffer"):
+            sub = fc.get(str_key)
+            if isinstance(sub, dict) and len(sub) > max_recent_frames:
+                sub.clear()
 
     # 1. cached_frame_outputs — stores mask tensors per frame
     cfo = inference_state.get("cached_frame_outputs")

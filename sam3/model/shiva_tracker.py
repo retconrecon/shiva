@@ -82,6 +82,14 @@ class ShivaTracker:
             })
         except Exception:
             pass
+        # Break reference cycles so GC can free session memory.
+        # Without this, the ShivaTracker instance holds _inference_state
+        # alive even after close_session removes it from the predictor.
+        self._inference_state = None
+        self._model = None
+        self.pixel_paint = None
+        self.verifier = None
+        self.injector = None
 
     def __init__(self, predictor, session_id, frame_dir, n_animals,
                  max_recent_frames=500, max_landmark_frames=50,
