@@ -572,7 +572,7 @@ class Sam3TrackerBase(torch.nn.Module):
             if len(valid_indices) >= max_num - 1:
                 break
 
-        if must_include not in valid_indices:
+        if must_include not in valid_indices and must_include in non_cond:
             valid_indices.append(must_include)
 
         return valid_indices

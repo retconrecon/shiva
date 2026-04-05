@@ -24,7 +24,8 @@ Usage:
 
 
 def prune_output_dict(inference_state, current_frame_idx,
-                      max_recent_frames=500, max_landmark_frames=50):
+                      max_recent_frames=500, max_landmark_frames=50,
+                      gc_interval=500):
     """Delete old frame entries from output dicts to bound VRAM.
 
     Prunes from BOTH:
@@ -61,7 +62,7 @@ def prune_output_dict(inference_state, current_frame_idx,
         _prune_outer_state(inference_state, current_frame_idx, max_recent_frames)
 
         # Periodic defragmentation (once per frame, not per inner state)
-        if current_frame_idx % 500 == 0:
+        if gc_interval > 0 and current_frame_idx % gc_interval == 0:
             import gc
             import torch
             gc.collect()
@@ -155,16 +156,6 @@ def _prune_single_state(inference_state, current_frame_idx,
         for f in frames_to_evict:
             obj_non_cond.pop(f, None)
 
-    # --- Step 4: Periodic defragmentation (T6) ---
-    # Repeated allocate-delete cycles fragment CUDA memory. gc.collect()
-    # breaks reference cycles so empty_cache() can actually return blocks.
-    if current_frame_idx % 1000 == 0:
-        import gc
-        import torch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     return {
         "pruned": len(frames_to_evict),
         "kept_landmarks": len(keep_frames),
@@ -176,12 +167,28 @@ def _prune_outer_state(inference_state, current_frame_idx, max_recent_frames):
     """Prune frame-indexed caches in the outer (multiplex) inference state.
 
     These accumulate per-frame and are never cleaned up by SAM3.1:
+    - feature_cache: per-frame backbone features (~5MB each, dominant VRAM leak)
     - cached_frame_outputs: per-frame mask dicts (GPU tensors)
     - tracker_metadata score/overlap/suppression dicts
     """
     recent_cutoff = current_frame_idx - max_recent_frames
 
-    # 1. cached_frame_outputs — stores mask tensors per frame, biggest GPU leak
+    # 0. feature_cache — backbone features per frame, ~5MB each, NEVER pruned by SAM3.1
+    # At 60k frames this alone consumes 300GB. Keep only recent + conditioning frames.
+    fc = inference_state.get("feature_cache")
+    if fc and len(fc) > max_recent_frames + 10:
+        # Collect conditioning frame indices (sacred, never evict)
+        cond_frames = set()
+        for inner in inference_state.get("sam2_inference_states", []):
+            cond_out = inner.get("output_dict", {}).get("cond_frame_outputs", {})
+            cond_frames.update(cond_out.keys())
+        # Non-string keys only (feature_cache also stores 'tracking_bounds', 'text', etc.)
+        frame_keys = [k for k in fc if isinstance(k, int) and k < recent_cutoff]
+        stale = [k for k in frame_keys if k not in cond_frames]
+        for k in stale:
+            del fc[k]
+
+    # 1. cached_frame_outputs — stores mask tensors per frame
     cfo = inference_state.get("cached_frame_outputs")
     if cfo and len(cfo) > max_recent_frames:
         stale = [f for f in cfo if f < recent_cutoff]

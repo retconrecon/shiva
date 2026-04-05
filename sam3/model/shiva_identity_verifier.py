@@ -56,6 +56,7 @@ class PairCrossingState:
     """Mutable state for one object pair's crossing lifecycle."""
     phase: CrossingPhase = CrossingPhase.CLEAR
     ref_embeddings: Dict[int, np.ndarray] = field(default_factory=dict)
+    ref_centroids: Dict[int, Tuple[float, float]] = field(default_factory=dict)
     approach_frame: Optional[int] = None
     overlap_frames: int = 0
     separating_retry_count: int = 0  # retries when frame_bgr unavailable
@@ -209,6 +210,7 @@ class ShivaIdentityVerifier:
         """
         state = self._pair_states[pair]
         state.ref_embeddings = {}
+        state.ref_centroids = {}
 
         for oid in pair:
             mask = bool_masks.get(oid)
@@ -219,6 +221,10 @@ class ShivaIdentityVerifier:
                 logger.debug("Cannot snapshot embedding for oid %d: bad crop", oid)
                 return False
             state.ref_embeddings[oid] = emb
+            # Capture reference centroid for trajectory continuity check
+            ys, xs = np.where(mask)
+            if len(xs) > 0:
+                state.ref_centroids[oid] = (float(xs.mean()), float(ys.mean()))
 
         return True
 
@@ -271,12 +277,43 @@ class ShivaIdentityVerifier:
         )
         margin = sim_swap - sim_keep
 
-        action = "swap" if margin > self.swap_margin else "no_swap"
+        # Trajectory continuity tiebreaker: when appearance is ambiguous
+        # (same-species animals with similar histograms), check whether
+        # post-crossing centroids are closer to the keep or swap assignment.
+        # This provides an identity signal independent of visual similarity.
+        traj_margin = 0.0
+        ref_c_a = state.ref_centroids.get(oid_a)
+        ref_c_b = state.ref_centroids.get(oid_b)
+        if ref_c_a is not None and ref_c_b is not None:
+            ys_a, xs_a = np.where(mask_a)
+            ys_b, xs_b = np.where(mask_b)
+            if len(xs_a) > 0 and len(xs_b) > 0:
+                cur_c_a = (float(xs_a.mean()), float(ys_a.mean()))
+                cur_c_b = (float(xs_b.mean()), float(ys_b.mean()))
+                # Distance under keep assignment
+                d_keep = (
+                    np.sqrt((cur_c_a[0] - ref_c_a[0])**2 + (cur_c_a[1] - ref_c_a[1])**2)
+                    + np.sqrt((cur_c_b[0] - ref_c_b[0])**2 + (cur_c_b[1] - ref_c_b[1])**2)
+                )
+                # Distance under swap assignment
+                d_swap = (
+                    np.sqrt((cur_c_a[0] - ref_c_b[0])**2 + (cur_c_a[1] - ref_c_b[1])**2)
+                    + np.sqrt((cur_c_b[0] - ref_c_a[0])**2 + (cur_c_b[1] - ref_c_a[1])**2)
+                )
+                # Normalize to a similarity-like scale (positive = swap is better)
+                if d_keep + d_swap > 0:
+                    traj_margin = (d_keep - d_swap) / (d_keep + d_swap)
+
+        # Combined decision: appearance margin + trajectory tiebreaker
+        # traj_margin > 0 means swap is closer to trajectory continuity
+        combined_margin = margin + 0.3 * traj_margin
+
+        action = "swap" if combined_margin > self.swap_margin else "no_swap"
 
         return SwapEvent(
             oid_a=oid_a,
             oid_b=oid_b,
-            margin=margin,
+            margin=combined_margin,
             frame_idx=frame_idx,
             sim_keep=sim_keep,
             sim_swap=sim_swap,
@@ -336,6 +373,7 @@ class ShivaIdentityVerifier:
                     # False alarm — never reached overlap
                     state.phase = CrossingPhase.CLEAR
                     state.ref_embeddings = {}
+                    state.ref_centroids = {}
                     state.approach_frame = None
 
             elif state.phase == CrossingPhase.OVERLAPPING:
@@ -355,6 +393,7 @@ class ShivaIdentityVerifier:
                     ))
                     state.phase = CrossingPhase.CLEAR
                     state.ref_embeddings = {}
+                    state.ref_centroids = {}
                     state.approach_frame = None
                     state.overlap_frames = 0
                 elif iou < self.overlap_threshold:

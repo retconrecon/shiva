@@ -2,6 +2,7 @@
 
 # pyre-unsafe
 
+import collections
 import contextlib
 import os
 import queue
@@ -447,8 +448,7 @@ class LazyVideoFrameLoader:
         self.img_mean = img_mean
         self.img_std = img_std
         self.cache_size = cache_size
-        self._cache = {}
-        self._access_order = []
+        self._cache = collections.OrderedDict()
 
         # Load first frame to fill video_height / video_width
         self.__getitem__(0)
@@ -468,16 +468,15 @@ class LazyVideoFrameLoader:
 
     def __getitem__(self, index):
         if index in self._cache:
+            self._cache.move_to_end(index)
             return self._cache[index]
 
         img = self._load_frame(index)
         self._cache[index] = img
-        self._access_order.append(index)
 
-        # Evict oldest frames when cache exceeds limit
+        # Evict LRU frames when cache exceeds limit
         while len(self._cache) > self.cache_size:
-            oldest = self._access_order.pop(0)
-            self._cache.pop(oldest, None)
+            self._cache.popitem(last=False)
 
         return img
 

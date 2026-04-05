@@ -64,6 +64,7 @@ class ShivaConfidenceInjector:
 
         self._last_injection_frame = {}  # {oid: frame_idx}
         self.injection_log = []  # [(frame_idx, oid, confidence, success)]
+        self._max_log_entries = 10000
 
     def check_and_inject(self, frame_idx, frame_bool, id_mapping=None,
                          frame_bgr=None, already_claimed=None):
@@ -186,6 +187,8 @@ class ShivaConfidenceInjector:
             success = self._inject_mask(frame_idx, sam3_obj_id, recovery_mask)
             self._last_injection_frame[oid] = frame_idx
             self.injection_log.append((frame_idx, oid, conf, success))
+            if len(self.injection_log) > self._max_log_entries:
+                self.injection_log = self.injection_log[-self._max_log_entries:]
 
             if success:
                 injected.append((oid, conf))
@@ -226,7 +229,12 @@ class ShivaConfidenceInjector:
 
             # Step 2: consolidate with memory encoding — this runs
             # _apply_non_overlapping_constraints + _run_memory_encoder
-            # so the corrected mask enters the memory bank
+            # so the corrected mask enters the memory bank.
+            # Temporarily disable temporal boundary prior during injection
+            # to avoid stale _prev_non_overlap_assignment from a different
+            # frame corrupting the injected mask's boundary assignments.
+            _saved_prior = getattr(inner_model, 'temporal_boundary_prior', 0.0)
+            inner_model.temporal_boundary_prior = 0.0
             batch_size = inner_model._get_obj_num(self._inference_state)
             consolidated_out = inner_model._consolidate_temp_output_across_obj(
                 inference_state=self._inference_state,
@@ -234,6 +242,7 @@ class ShivaConfidenceInjector:
                 is_cond=False,
                 run_mem_encoder=True,
             )
+            inner_model.temporal_boundary_prior = _saved_prior
 
             # Step 3: store the consolidated output (with memory features)
             # in the main output dict so future frames can attend to it

@@ -1633,13 +1633,6 @@ class VideoTrackingMultiplex(nn.Module):
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
-        # DIAGNOSTIC: log flag state on first frame to verify propagation
-        if not getattr(self, '_shiva_diag_logged', False):
-            print(f"    [DIAG] _encode_new_memory: self={type(self).__name__}, "
-                  f"non_overlap_masks_for_mem_enc={self.non_overlap_masks_for_mem_enc}, "
-                  f"occlusion_memory_freeze={getattr(self, 'occlusion_memory_freeze', 'NOT SET')}, "
-                  f"temporal_boundary_prior={getattr(self, 'temporal_boundary_prior', 'NOT SET')}")
-            self._shiva_diag_logged = True
 
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
@@ -1652,9 +1645,28 @@ class VideoTrackingMultiplex(nn.Module):
             if _freeze:
                 _pre_clamp_areas = (pred_masks_high_res > 0).flatten(1).sum(dim=1).float()
 
-            pred_masks_high_res = self._apply_non_overlapping_constraints(
-                pred_masks_high_res
-            )
+            # TIAB: learned identity-aware boundary refinement (replaces argmax)
+            _tiab = getattr(self, '_tiab_module', None)
+            if _tiab is not None:
+                _tiab_appearance = getattr(self, '_tiab_appearance_embs', None)
+                _tiab_history = getattr(self, '_tiab_centroid_history', None)
+                if _tiab_appearance is not None and _tiab_history is not None:
+                    # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
+                    pred_masks_high_res = _tiab(
+                        pred_masks=pred_masks_high_res.squeeze(1),
+                        pix_feat=pix_feat,
+                        appearance_embs=_tiab_appearance,
+                        centroid_history=_tiab_history,
+                        object_score_logits=object_score_logits,
+                    ).unsqueeze(1)
+                else:
+                    pred_masks_high_res = self._apply_non_overlapping_constraints(
+                        pred_masks_high_res
+                    )
+            else:
+                pred_masks_high_res = self._apply_non_overlapping_constraints(
+                    pred_masks_high_res
+                )
 
             # SHIVA memory freeze: detect objects whose mask was severely
             # clamped by non-overlap constraints. Zero their mask contribution
@@ -1664,10 +1676,10 @@ class VideoTrackingMultiplex(nn.Module):
                 _post_clamp_areas = (pred_masks_high_res > 0).flatten(1).sum(dim=1).float()
                 _area_ratio = _post_clamp_areas / _pre_clamp_areas.clamp(min=1.0)
                 _severely_clamped = _area_ratio < _freeze_thresh
-                if _severely_clamped.any():
-                    _frozen_indices = _severely_clamped.nonzero(as_tuple=True)[0].tolist()
-                    print(f"    MEMORY FREEZE: objects {_frozen_indices} "
-                          f"(area_ratio={_area_ratio[_severely_clamped].tolist()})")
+                # Don't freeze ALL objects — that starves the memory encoder
+                # with all-negative logits ("no object" encoding). Better to
+                # accept degraded masks than encode nothing at all.
+                if _severely_clamped.any() and not _severely_clamped.all():
                     pred_masks_high_res = pred_masks_high_res.clone()
                     pred_masks_high_res[_severely_clamped] = -10.0
 
@@ -2645,13 +2657,6 @@ class VideoTrackingMultiplex(nn.Module):
         batch_size = pred_masks.size(0)
         if batch_size == 1:
             return pred_masks
-
-        # DIAGNOSTIC: log on first call to confirm this method is reached
-        if not getattr(self, '_shiva_nonoverlap_diag_logged', False):
-            print(f"    [DIAG] _apply_non_overlapping_constraints: self={type(self).__name__}, "
-                  f"batch_size={batch_size}, "
-                  f"temporal_boundary_prior={getattr(self, 'temporal_boundary_prior', 'NOT SET')}")
-            self._shiva_nonoverlap_diag_logged = True
 
         device = pred_masks.device
 
