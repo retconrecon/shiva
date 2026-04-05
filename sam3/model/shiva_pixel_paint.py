@@ -21,7 +21,7 @@ JPEG filenames ({:05d}.jpg) and will silently return {} on other naming schemes.
 
 import logging
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import cv2
 import numpy as np
@@ -51,7 +51,7 @@ class ShivaPixelPaintRecovery:
         self.bg_median = None
         self.bg_std = None
         # defaultdict so arbitrary object IDs (not just 0..N-1) work without KeyError
-        self._area_history = defaultdict(list)
+        self._area_history = defaultdict(lambda: deque(maxlen=500))
         self._clean_count = 0
         self.recovery_log = []  # [{"frame": int, "oid": int, "blob_area": int, "cost": float}]
         self._max_log_entries = 10000
@@ -137,9 +137,7 @@ class ShivaPixelPaintRecovery:
             # Recompute median once we have enough samples, then periodically
             if len(history) >= 30 and (len(history) <= 100 or len(history) % 50 == 0):
                 self.median_areas[oid] = float(np.median(history[-500:]))
-                # Trim to prevent unbounded growth on long videos
-                if len(history) > 1000:
-                    self._area_history[oid] = history[-500:]
+                # deque(maxlen=500) handles trimming automatically
 
     def update_last_centroid(self, oid, cx, cy):
         """Update last known centroid for an object (for spatial matching)."""
@@ -290,8 +288,13 @@ class ShivaPixelPaintRecovery:
         if self.bg_median is None:
             return {}
 
-        # Find missing/artifact masks — use known OIDs from median_areas
-        known_oids = sorted(self.median_areas.keys())
+        # Find missing/artifact masks — only consider OIDs that appear in
+        # both median_areas AND the current frame's expected set. Objects
+        # that were removed from tracking should not trigger recovery.
+        known_oids = sorted(
+            oid for oid in self.median_areas.keys()
+            if oid < self.n_animals  # only expected animals
+        )
         missing_oids = []
         healthy_masks = {}
         for oid in known_oids:

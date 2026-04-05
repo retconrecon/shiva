@@ -102,8 +102,8 @@ class ShivaTracker:
                 "type": "close_session",
                 "session_id": self.session_id,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Session close failed: %s", e)
 
     def __init__(self, predictor, session_id, frame_dir, n_animals,
                  max_recent_frames=500, max_landmark_frames=50,
@@ -135,23 +135,22 @@ class ShivaTracker:
         # Reset SENTINEL status from any previous session and set memory freeze flags
         self._model = predictor.model if hasattr(predictor, 'model') else None
         if self._model is not None:
-            self._model._shiva_sentinel_status = "GREEN"
-            self._model._shiva_crossing_active = False
-            # Memory freeze flags go on the INNER tracker model where
-            # _encode_new_memory runs, not the outer Sam3MultiplexTracking
+            # Clean stale SHIVA attrs from BOTH outer and inner model
+            # (mirrors __exit__ cleanup for non-context-manager usage)
             _inner = self._model
             if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
                 _inner = self._model.tracker.model
+            for attr in self._SHIVA_MODEL_ATTRS:
+                if hasattr(self._model, attr):
+                    delattr(self._model, attr)
+                if _inner is not self._model and hasattr(_inner, attr):
+                    delattr(_inner, attr)
+            # Set fresh state
+            self._model._shiva_sentinel_status = "GREEN"
+            self._model._shiva_crossing_active = False
             _inner.occlusion_memory_freeze = occlusion_memory_freeze
             _inner.occlusion_freeze_threshold = occlusion_freeze_threshold
             _inner.temporal_boundary_prior = temporal_boundary_prior
-            # Reset stale state from previous sessions
-            if hasattr(_inner, '_prev_non_overlap_assignment'):
-                del _inner._prev_non_overlap_assignment
-            if hasattr(_inner, '_shiva_diag_logged'):
-                del _inner._shiva_diag_logged
-            if hasattr(_inner, '_shiva_nonoverlap_diag_logged'):
-                del _inner._shiva_nonoverlap_diag_logged
             if occlusion_memory_freeze:
                 logger.info("Occlusion memory freeze enabled on %s (threshold=%.2f)",
                             type(_inner).__name__, occlusion_freeze_threshold)
@@ -300,16 +299,31 @@ class ShivaTracker:
 
                 # Seed area fingerprints from RAW masks (before BFS completion)
                 # so the baseline isn't inflated by BFS-assigned appendages.
-                # SAM3.1 raw masks don't consistently include fins, so the
-                # fingerprint should reflect what the model actually produces.
+                # Delay seeding if any pair overlaps (crossing at frame 0 would
+                # poison the seed with argmax-carved mask areas).
                 if not _seeded_areas and self.pixel_paint is not None and frame_bool:
-                    initial = {
-                        oid: int(m.sum()) for oid, m in frame_bool.items()
-                        if int(m.sum()) > self.pixel_paint.min_fish_area
-                    }
-                    if initial:
-                        self.pixel_paint.set_initial_areas(initial)
-                        _seeded_areas = True
+                    # Check that no pair has significant IoU (crossing)
+                    _has_overlap = False
+                    if len(frame_bool) >= 2:
+                        _oids = sorted(frame_bool.keys())
+                        for _i in range(len(_oids)):
+                            for _j in range(_i + 1, len(_oids)):
+                                _mi, _mj = frame_bool[_oids[_i]], frame_bool[_oids[_j]]
+                                _inter = int((_mi & _mj).sum())
+                                _union = int((_mi | _mj).sum())
+                                if _union > 0 and _inter / _union > 0.05:
+                                    _has_overlap = True
+                                    break
+                            if _has_overlap:
+                                break
+                    if not _has_overlap:
+                        initial = {
+                            oid: int(m.sum()) for oid, m in frame_bool.items()
+                            if int(m.sum()) > self.pixel_paint.min_fish_area
+                        }
+                        if initial:
+                            self.pixel_paint.set_initial_areas(initial)
+                            _seeded_areas = True
 
                 # Update median areas from raw masks (before BFS completion)
                 if self.pixel_paint is not None and frame_bool:
@@ -361,17 +375,17 @@ class ShivaTracker:
                     # closer to a different object's store than its own.
                     # This catches silent identity swaps that area checks miss.
                     identity_mismatch = False
-                    if self.appearance_store is not None and len(frame_bool) >= 2 and frame_bgr is not None:
+                    if getattr(self, '_appearance_store', None) is not None and len(frame_bool) >= 2 and frame_bgr is not None:
                         from sam3.model.shiva_appearance import histogram_intersection_distance
                         _dist_fn = histogram_intersection_distance
-                        if getattr(self.appearance_store, 'distance_metric', '') == 'cosine':
+                        if getattr(self._appearance_store, 'distance_metric', '') == 'cosine':
                             _dist_fn = lambda a, b: 1.0 - float(np.dot(a, b))
                         oids_list = sorted(frame_bool.keys())
                         for oid in oids_list:
-                            own_emb = self.appearance_store.get(oid)
+                            own_emb = self._appearance_store.embeddings.get(oid)
                             if own_emb is None:
                                 continue
-                            cur_emb = self.appearance_store.extract_embedding(
+                            cur_emb = self._appearance_store.extract_embedding(
                                 frame_bool[oid], frame_bgr,
                             )
                             if cur_emb is None:
@@ -380,7 +394,7 @@ class ShivaTracker:
                             for other_oid in oids_list:
                                 if other_oid == oid:
                                     continue
-                                other_emb = self.appearance_store.get(other_oid)
+                                other_emb = self._appearance_store.embeddings.get(other_oid)
                                 if other_emb is None:
                                     continue
                                 other_dist = _dist_fn(cur_emb, other_emb)
@@ -426,6 +440,33 @@ class ShivaTracker:
                         cx, cy = ShivaPixelPaintRecovery._largest_component_centroid(rmask)
                         if cx is not None:
                             self.pixel_paint.update_last_centroid(oid, cx, cy)
+
+                    # Inject recovery masks into SAM3.1's memory so future frames
+                    # attend to corrected masks, not the bad ones. Without this,
+                    # pixel-paint recovery is cosmetic only (consumer sees recovery
+                    # but SAM3.1 keeps propagating from the bad mask).
+                    if recovery_masks and self.injector is None:
+                        _inner = self._model
+                        if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+                            _inner = self._model.tracker.model
+                        if hasattr(_inner, 'add_new_masks'):
+                            for oid, rmask in recovery_masks.items():
+                                try:
+                                    mask_t = torch.from_numpy(rmask.astype(np.float32)).unsqueeze(0).to('cuda')
+                                    _inner.add_new_masks(
+                                        inference_state=self._inference_state,
+                                        frame_idx=frame_idx,
+                                        obj_ids=[oid],
+                                        masks=mask_t,
+                                    )
+                                    _inner._consolidate_temp_output_across_obj(
+                                        inference_state=self._inference_state,
+                                        frame_idx=frame_idx,
+                                        is_cond=False,
+                                        run_mem_encoder=True,
+                                    )
+                                except Exception as e:
+                                    logger.debug("Recovery mask injection failed for oid %d: %s", oid, e)
 
                 # Confidence-triggered mid-tracking mask injection
                 # Pass recovery_masks so injector doesn't claim blobs already
@@ -473,8 +514,8 @@ class ShivaTracker:
                     "type": "reset_session",
                     "session_id": self.session_id,
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Session reset failed during error handling: %s", e)
             # Free zombie GPU tensors from generator locals (hotstart_buffer, etc.)
             import gc
             gc.collect()
@@ -579,8 +620,12 @@ class ShivaTracker:
                     ptr = entry.get("obj_ptr")
                     if ptr is not None and idx_a < ptr.shape[0] and idx_b < ptr.shape[0]:
                         ptr[idx_a], ptr[idx_b] = ptr[idx_b].clone(), ptr[idx_a].clone()
-        except Exception:
-            pass  # Best-effort — don't break swap on internal access failure
+        except Exception as e:
+            logger.warning(
+                "obj_ptr swap failed for oid %d <-> %d: %s. "
+                "Memory attention may retrieve wrong identity for ~7 frames.",
+                oid_a, oid_b, e,
+            )
 
         logger.info("Applied swap: oid %d <-> %d", oid_a, oid_b)
 

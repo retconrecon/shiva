@@ -247,6 +247,7 @@ class ShivaConfidenceInjector:
             # Step 3: store the consolidated output (with memory features)
             # in the main output dict so future frames can attend to it
             storage_key = "non_cond_frame_outputs"
+            consolidated_out["_shiva_injected"] = True
             self._inference_state["output_dict"][storage_key][frame_idx] = consolidated_out
             # Also update per-object outputs
             inner_model._add_output_per_object(

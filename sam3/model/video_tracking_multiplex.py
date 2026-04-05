@@ -1647,6 +1647,14 @@ class VideoTrackingMultiplex(nn.Module):
 
             # TIAB: learned identity-aware boundary refinement (replaces argmax)
             _tiab = getattr(self, '_tiab_module', None)
+            if _tiab is not None and not getattr(self, '_tiab_prior_warned', False):
+                _prior = getattr(self, 'temporal_boundary_prior', 0.0)
+                if _prior > 0:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "TIAB active with temporal_boundary_prior=%.2f — "
+                        "prior is bypassed when TIAB handles boundary refinement", _prior)
+                self._tiab_prior_warned = True
             if _tiab is not None:
                 _tiab_appearance = getattr(self, '_tiab_appearance_embs', None)
                 _tiab_history = getattr(self, '_tiab_centroid_history', None)
@@ -2817,7 +2825,7 @@ class VideoTrackingMultiplex(nn.Module):
             if len(valid_indices) >= max_num - 1:
                 break
 
-        if must_include not in valid_indices:
+        if must_include not in valid_indices and must_include in non_cond:
             valid_indices.append(must_include)
 
         return valid_indices

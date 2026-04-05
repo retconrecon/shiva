@@ -1146,13 +1146,34 @@ class Sam3MultiplexBase(Sam3VideoBase):
             adt_result = realize_adt_result(
                 adt_result, tracker_metadata_prev, det_mask_preds
             )
+            # When BoT-SORT is active, use the Hungarian-matched mapping
+            # instead of raw IoU argmax. Raw IoU argmax can map a detection
+            # to the wrong track, overriding BoT-SORT's identity-aware assignment.
+            recondition_mapping = adt_result.trk_id_to_max_iou_high_conf_det
+            if getattr(self, 'use_botsort_association', False):
+                # Build mapping from Hungarian-matched im_mask
+                _hungarian_mapping = {}
+                im = adt_result.im_mask  # [N_det, M_trk] bool
+                if im is not None and im.any():
+                    trk_ids = adt_result.trk_obj_ids
+                    det_is_high_conf = adt_result.det_is_high_conf
+                    for det_idx in range(im.shape[0]):
+                        if not det_is_high_conf[det_idx]:
+                            continue
+                        matched_trks = im[det_idx].nonzero(as_tuple=True)[0]
+                        if len(matched_trks) == 1:
+                            trk_idx = matched_trks[0].item()
+                            trk_id = int(trk_ids[trk_idx])
+                            _hungarian_mapping[trk_id] = det_idx
+                if _hungarian_mapping:
+                    recondition_mapping = _hungarian_mapping
             # NOTE: sam2_low_res_mask_global is modified in-place on all GPUs.
             with torch.profiler.record_function("_recondition_masklets"):
                 tracker_states_local, reconditioned_obj_ids = (
                     self._recondition_masklets(
                         frame_idx,
                         det_out,
-                        adt_result.trk_id_to_max_iou_high_conf_det,
+                        recondition_mapping,
                         tracker_states_local,
                         tracker_metadata_prev,
                         tracker_obj_scores_global,

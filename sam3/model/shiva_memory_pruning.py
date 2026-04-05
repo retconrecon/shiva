@@ -71,10 +71,18 @@ def prune_output_dict(inference_state, current_frame_idx,
         return total if total["pruned"] > 0 else None
 
     # Direct path: output_dict at top level
-    return _prune_single_state(
+    result = _prune_single_state(
         inference_state, current_frame_idx,
         max_recent_frames, max_landmark_frames,
     )
+    _prune_outer_state(inference_state, current_frame_idx, max_recent_frames)
+    if gc_interval > 0 and current_frame_idx % gc_interval == 0:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return result
 
 
 def _prune_single_state(inference_state, current_frame_idx,

@@ -15,14 +15,11 @@ import torch.nn.functional as F
 def mask_centroid(mask_probs):
     """Compute differentiable centroid matching eval's largest-component behavior.
 
-    Uses a hard threshold at 0.5 to binarize, then weights soft probabilities
-    by the binary mask. This ensures the centroid is computed over the same
-    region as eval's _largest_component_centroid (largest connected blob),
-    while keeping gradients flowing through mask_probs.
-
-    For single-component masks (the common case), this is equivalent to
-    a standard soft weighted mean. For multi-component masks, the hard
-    threshold zeros out small fragments, matching eval behavior.
+    Eval uses _largest_component_centroid: binarize, find connected components,
+    take centroid of the largest component only. This function replicates that
+    by computing connected components on the detached binary mask (non-differentiable)
+    and using the largest-component mask to gate the soft probabilities
+    (preserving gradient flow through mask_probs).
 
     Args:
         mask_probs: [B, H, W] sigmoid probabilities in (0, 1)
@@ -30,14 +27,29 @@ def mask_centroid(mask_probs):
     Returns:
         centroids: [B, 2] (x, y) normalized to [0, 1]
     """
+    from scipy.ndimage import label as ndlabel
+
     B, H, W = mask_probs.shape
     device = mask_probs.device
 
-    # Hard threshold with straight-through gradient: binary mask for
-    # selecting which pixels contribute, soft probs for gradient flow
-    binary = (mask_probs > 0.5).float()
-    # Straight-through: use binary in forward, soft probs in backward
-    weighted = binary.detach() * mask_probs
+    # Find largest connected component per object (non-differentiable)
+    binary_np = (mask_probs.detach().cpu().numpy() > 0.5)
+    largest_mask = torch.zeros_like(mask_probs)
+    for b in range(B):
+        labeled, n_comp = ndlabel(binary_np[b])
+        if n_comp == 0:
+            largest_mask[b] = 0
+        elif n_comp == 1:
+            largest_mask[b] = torch.from_numpy(binary_np[b].astype(float)).to(device)
+        else:
+            comp_sizes = [(labeled == c).sum() for c in range(1, n_comp + 1)]
+            largest_id = max(range(1, n_comp + 1), key=lambda c: comp_sizes[c - 1])
+            largest_mask[b] = torch.from_numpy(
+                (labeled == largest_id).astype(float)
+            ).to(device)
+
+    # Gate soft probs by largest-component mask (straight-through gradient)
+    weighted = largest_mask.detach() * mask_probs
 
     # Coordinate grids normalized to [0, 1]
     gy = torch.linspace(0, 1, H, device=device).view(1, H, 1).expand(B, H, W)
