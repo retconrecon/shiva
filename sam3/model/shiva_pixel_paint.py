@@ -37,7 +37,8 @@ class ShivaPixelPaintRecovery:
     def __init__(self, frame_dir, n_animals, bg_sample_frames=300,
                  area_lower=0.4, min_fish_area=200, max_fish_area=20000,
                  n_frames=None, last_known_centroids=None,
-                 bg_std_multiplier=2.5, bg_additive_offset=8.0):
+                 bg_std_multiplier=2.5, bg_additive_offset=8.0,
+                 max_recovery_cost=3.0):
         self.frame_dir = frame_dir
         self.n_animals = n_animals
         self.bg_sample_frames = bg_sample_frames
@@ -47,6 +48,7 @@ class ShivaPixelPaintRecovery:
         self.n_frames = n_frames
         self.bg_std_multiplier = bg_std_multiplier
         self.bg_additive_offset = bg_additive_offset
+        self.max_recovery_cost = max_recovery_cost
         self.median_areas = {}  # {oid: float}
         self.bg_median = None
         self.bg_std = None
@@ -136,8 +138,7 @@ class ShivaPixelPaintRecovery:
 
             # Recompute median once we have enough samples, then periodically
             if len(history) >= 30 and (len(history) <= 100 or len(history) % 50 == 0):
-                self.median_areas[oid] = float(np.median(history[-500:]))
-                # deque(maxlen=500) handles trimming automatically
+                self.median_areas[oid] = float(np.median(list(history)))
 
     def update_last_centroid(self, oid, cx, cy):
         """Update last known centroid for an object (for spatial matching)."""
@@ -416,7 +417,7 @@ class ShivaPixelPaintRecovery:
         row_ind, col_ind = linear_sum_assignment(cost)
 
         # Reject matches above a maximum cost threshold
-        max_cost = 3.0  # area ratio > 3x or centroid > 1500px away
+        max_cost = self.max_recovery_cost
         recoveries = {}
         for r, c in zip(row_ind, col_ind):
             if cost[r, c] < max_cost:

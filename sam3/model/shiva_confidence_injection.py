@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 class ShivaConfidenceInjector:
+    _MAX_PROTECTED = 100
+
     """Monitors per-object confidence and injects pixel-paint masks when low.
 
     Parameters
@@ -254,13 +256,17 @@ class ShivaConfidenceInjector:
                 self._inference_state, frame_idx, consolidated_out, storage_key,
             )
 
-            # Protect this frame from pruning, with a cap
+            # Protect this frame from pruning. Evict the frame nearest
+            # to current (most redundant) rather than oldest (may be a
+            # critical long-range anchor).
             protected = self._inference_state.setdefault("_shiva_protected_frames", set())
             protected.add(frame_idx)
-            _MAX_PROTECTED = 100
-            if len(protected) > _MAX_PROTECTED:
-                oldest = min(protected)
-                protected.discard(oldest)
+            if len(protected) > self._MAX_PROTECTED:
+                nearest = min(
+                    protected,
+                    key=lambda f: abs(frame_idx - f) if f != frame_idx else float('inf'),
+                )
+                protected.discard(nearest)
 
             return True
         except Exception as e:

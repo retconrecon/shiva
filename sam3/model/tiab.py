@@ -43,6 +43,10 @@ class BoundaryAttention(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+    # Max contested pixels before downsampling to prevent OOM.
+    # 300K contested pixels would create a 5.76TB attention matrix.
+    MAX_CONTESTED = 4096
+
     def forward(self, pixel_features, identity_embs, contested_mask):
         """
         Args:
@@ -65,20 +69,28 @@ class BoundaryAttention(nn.Module):
         # Extract contested pixel features: [B, n_contested, hidden]
         contested_feats = pf[:, :, contested_mask].permute(0, 2, 1)
 
-        # Identity queries: [B, 1, hidden]
-        id_query = self.identity_proj(identity_embs).unsqueeze(1)
+        # Cap contested pixels to prevent OOM — randomly subsample if too many
+        if n_contested > self.MAX_CONTESTED:
+            indices = torch.randperm(n_contested, device=pf.device)[:self.MAX_CONTESTED]
+            contested_feats = contested_feats[:, indices]
 
-        # Cross-attention: each object's identity attends to all contested pixels
-        # Query: identity [B, 1, hidden], Key/Value: contested pixels [B, n_contested, hidden]
-        attn_out, _ = self.cross_attn(
-            id_query.expand(-1, n_contested, -1),
-            contested_feats,
-            contested_feats,
-        )
-        attn_out = self.norm(attn_out + contested_feats)
+        # Identity query: single vector per object → global context
+        # O(n_contested) instead of O(n_contested²)
+        id_query = self.identity_proj(identity_embs).unsqueeze(1)  # [B, 1, hidden]
+        context, _ = self.cross_attn(
+            id_query, contested_feats, contested_feats,
+        )  # [B, 1, hidden]
+
+        # Combine global context with per-pixel features via pointwise MLP
+        # Context is broadcast to all contested pixels
+        if n_contested > self.MAX_CONTESTED:
+            # Re-extract full contested features for the refinement head
+            contested_feats = pf[:, :, contested_mask].permute(0, 2, 1)
+        combined = contested_feats + context.expand_as(contested_feats)
+        combined = self.norm(combined)
 
         # Produce per-pixel adjustment
-        adjustments = self.refine_head(attn_out).squeeze(-1)  # [B, n_contested]
+        adjustments = self.refine_head(combined).squeeze(-1)  # [B, n_contested]
 
         # Scatter back to full spatial grid
         refinement = torch.zeros(B, H, W, device=pixel_features.device)
@@ -109,6 +121,10 @@ class TemporalIdentityEncoder(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
         )
+        # Phase 1 training: drop appearance entirely so the model
+        # learns trajectory-only identity. Set to True during Phase 1
+        # training, False during Phase 2+ and inference.
+        self.drop_appearance = False
 
     def forward(self, appearance_emb, centroid_history):
         """
@@ -123,8 +139,14 @@ class TemporalIdentityEncoder(nn.Module):
         traj_out, _ = self.traj_gru(centroid_history)
         traj_feat = self.traj_proj(traj_out[:, -1])  # last hidden state
 
-        # Appearance
-        appear_feat = self.appear_proj(appearance_emb)
+        # Appearance — zeroed during Phase 1 training so fuse layer
+        # learns to rely on trajectory only. appear_proj weights stay
+        # at initialization, ready for Phase 2 fine-tuning with real
+        # embeddings.
+        if self.drop_appearance:
+            appear_feat = torch.zeros_like(traj_feat)
+        else:
+            appear_feat = self.appear_proj(appearance_emb)
 
         # Fuse
         return self.fuse(torch.cat([appear_feat, traj_feat], dim=-1))
@@ -199,14 +221,6 @@ class TemporalIdentityBoundaryModule(nn.Module):
         )
         self.gate = RefinementGate(identity_dim=identity_dim)
 
-        # Upsample backbone features (stride 16) to mask resolution
-        self.feat_upsample = nn.Sequential(
-            nn.ConvTranspose2d(backbone_dim, hidden_dim, 4, stride=4),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim, hidden_dim, 4, stride=4),
-            nn.GELU(),
-        )
-
     def forward(
         self,
         pred_masks,
@@ -254,20 +268,31 @@ class TemporalIdentityBoundaryModule(nn.Module):
             appearance_embs, centroid_history,
         )  # [B, identity_dim]
 
-        # Step 3: Upsample backbone features to mask resolution
-        upsampled_feat = self.feat_upsample(pix_feat)
-        # Resize to match mask dims if needed
-        if upsampled_feat.shape[-2:] != (H, W):
-            upsampled_feat = F.interpolate(
-                upsampled_feat, size=(H, W), mode="bilinear", align_corners=False,
-            )
+        # Step 3: Operate at feature resolution to avoid 512MB upsample.
+        # Downsample contested mask to pix_feat resolution, run attention
+        # there (~3MB instead of ~512MB), then bilinear-upsample the
+        # refinement back to mask resolution.
+        Hf, Wf = pix_feat.shape[-2:]
+        contested_feat_res = F.interpolate(
+            contested.unsqueeze(0).unsqueeze(0).float(),
+            size=(Hf, Wf), mode="nearest",
+        ).squeeze(0).squeeze(0).bool()
 
-        # Step 4: Boundary attention
-        refinement = self.boundary_attention(
-            upsampled_feat, identity_embs, contested,
-        )  # [B, H, W]
+        # Step 4: Boundary attention at feature resolution
+        refinement_feat = self.boundary_attention(
+            pix_feat, identity_embs, contested_feat_res,
+        )  # [B, Hf, Wf]
 
-        # Step 5: Gate
+        # Step 5: Upsample refinement to mask resolution (no learnable params)
+        refinement = F.interpolate(
+            refinement_feat.unsqueeze(1), size=(H, W),
+            mode="bilinear", align_corners=False,
+        ).squeeze(1)  # [B, H, W]
+
+        # Zero out refinement at non-contested pixels (upsampling may bleed)
+        refinement = refinement * contested.float()
+
+        # Step 6: Gate
         gate_val = self.gate(
             identity_embs,
             object_score_logits.view(B, 1) if object_score_logits.dim() == 1
@@ -275,7 +300,7 @@ class TemporalIdentityBoundaryModule(nn.Module):
         )  # [B, 1]
         gated_refinement = refinement * gate_val.unsqueeze(-1)
 
-        # Step 6: Add refinement to original logits, then argmax
+        # Step 7: Add refinement to original logits, then argmax
         refined_masks = pred_masks + gated_refinement
         return self._hard_argmax(refined_masks)
 

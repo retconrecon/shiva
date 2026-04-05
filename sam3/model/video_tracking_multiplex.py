@@ -1658,7 +1658,15 @@ class VideoTrackingMultiplex(nn.Module):
             if _tiab is not None:
                 _tiab_appearance = getattr(self, '_tiab_appearance_embs', None)
                 _tiab_history = getattr(self, '_tiab_centroid_history', None)
-                if _tiab_appearance is not None and _tiab_history is not None:
+                _tiab_B = getattr(self, '_tiab_expected_B', -1)
+                _model_B = pred_masks_high_res.size(0)
+                # Only run TIAB when attributes are set AND batch dimension
+                # matches. Object add/remove changes B between when attrs
+                # were set (after yield) and when _encode_new_memory runs
+                # (during next frame's forward). Mismatch → fall back to argmax.
+                if (_tiab_appearance is not None
+                        and _tiab_history is not None
+                        and _tiab_B == _model_B):
                     # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
                     pred_masks_high_res = _tiab(
                         pred_masks=pred_masks_high_res.squeeze(1),
@@ -2676,6 +2684,12 @@ class VideoTrackingMultiplex(nn.Module):
         _prev = getattr(self, '_prev_non_overlap_assignment', None)
 
         if _prior_alpha > 0 and _prev is not None:
+            # Invalidate prior if batch size changed (object add/remove)
+            # — the stored indices reference a different object set
+            _prev_B = getattr(self, '_prev_non_overlap_batch_size', -1)
+            if _prev_B != batch_size:
+                _prev = None
+                self._prev_non_overlap_assignment = None
             # _prev is (1, 1, H, W) with object indices from the previous frame
             # Resize if dimensions changed
             if _prev.shape[-2:] != pred_masks.shape[-2:]:
@@ -2708,6 +2722,7 @@ class VideoTrackingMultiplex(nn.Module):
         # Store assignment for next frame's prior
         if _prior_alpha > 0:
             self._prev_non_overlap_assignment = max_obj_inds.detach()
+            self._prev_non_overlap_batch_size = batch_size
 
         return pred_masks
 

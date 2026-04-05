@@ -222,8 +222,16 @@ class ShivaIdentityVerifier:
                 return False
             state.ref_embeddings[oid] = emb
             # Capture reference centroid for trajectory continuity check
-            ys, xs = np.where(mask)
-            if len(xs) > 0:
+            # Use largest-component centroid to match tracking pipeline
+            from scipy.ndimage import label as _ndlabel
+            labeled, n_comp = _ndlabel(mask)
+            if n_comp >= 1:
+                if n_comp == 1:
+                    ys, xs = np.where(mask)
+                else:
+                    comp_sizes = [(labeled == c).sum() for c in range(1, n_comp + 1)]
+                    largest = max(range(1, n_comp + 1), key=lambda c: comp_sizes[c - 1])
+                    ys, xs = np.where(labeled == largest)
                 state.ref_centroids[oid] = (float(xs.mean()), float(ys.mean()))
 
         return True
@@ -285,11 +293,23 @@ class ShivaIdentityVerifier:
         ref_c_a = state.ref_centroids.get(oid_a)
         ref_c_b = state.ref_centroids.get(oid_b)
         if ref_c_a is not None and ref_c_b is not None:
-            ys_a, xs_a = np.where(mask_a)
-            ys_b, xs_b = np.where(mask_b)
-            if len(xs_a) > 0 and len(xs_b) > 0:
-                cur_c_a = (float(xs_a.mean()), float(ys_a.mean()))
-                cur_c_b = (float(xs_b.mean()), float(ys_b.mean()))
+            # Use largest-component centroid for post-crossing comparison
+            from scipy.ndimage import label as _ndlabel
+            def _lc_centroid(mask):
+                labeled, n_comp = _ndlabel(mask)
+                if n_comp == 0:
+                    return None
+                if n_comp == 1:
+                    ys, xs = np.where(mask)
+                else:
+                    sizes = [(labeled == c).sum() for c in range(1, n_comp + 1)]
+                    largest = max(range(1, n_comp + 1), key=lambda c: sizes[c - 1])
+                    ys, xs = np.where(labeled == largest)
+                return (float(xs.mean()), float(ys.mean()))
+
+            cur_c_a = _lc_centroid(mask_a)
+            cur_c_b = _lc_centroid(mask_b)
+            if cur_c_a is not None and cur_c_b is not None:
                 # Distance under keep assignment
                 d_keep = (
                     np.sqrt((cur_c_a[0] - ref_c_a[0])**2 + (cur_c_a[1] - ref_c_a[1])**2)

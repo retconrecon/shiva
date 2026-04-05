@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from sam3.model.tiab import TemporalIdentityBoundaryModule
 from sam3.model.tiab_dataset import TIABDataset
-from sam3.model.tiab_losses import tiab_combined_loss
+from sam3.model.tiab_losses import mask_centroid, tiab_combined_loss
 
 
 def train_tiab(
@@ -77,6 +77,15 @@ def train_tiab(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    # Reproducibility
+    import random
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     # Load dataset
     dataset = TIABDataset(
         data_dirs,
@@ -97,11 +106,19 @@ def train_tiab(
         contest_margin=contest_margin,
     ).to(device)
 
-    print(f"TIAB parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # Phase 1: drop appearance so model learns trajectory-only identity.
+    # appear_proj weights stay at init, ready for Phase 2 fine-tuning.
+    model.identity_encoder.drop_appearance = True
 
-    # Optimizer
+    print(f"TIAB parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print("Phase 1: appearance dropped — training trajectory-only identity")
+
+    # Optimizer — exclude appear_proj from optimization in Phase 1
+    # (its weights should stay at initialization for Phase 2)
+    appear_proj_ids = set(id(p) for p in model.identity_encoder.appear_proj.parameters())
+    phase1_params = [p for p in model.parameters() if id(p) not in appear_proj_ids]
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=weight_decay,
+        phase1_params, lr=lr, weight_decay=weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs,
@@ -178,7 +195,6 @@ def train_tiab(
                 # Build identity map via Hungarian matching between
                 # predicted mask centroids and GT centroids. SAM3.1's object
                 # ordering has no guaranteed correspondence to GT animal IDs.
-                from sam3.model.tiab_losses import mask_centroid
                 with torch.no_grad():
                     pred_cents = mask_centroid(torch.sigmoid(pm)).cpu().numpy()
                 gt_np = (gt_c / image_size).cpu().numpy()

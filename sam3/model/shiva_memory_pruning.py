@@ -25,7 +25,7 @@ Usage:
 
 def prune_output_dict(inference_state, current_frame_idx,
                       max_recent_frames=500, max_landmark_frames=50,
-                      gc_interval=500):
+                      gc_interval=100):
     """Delete old frame entries from output dicts to bound VRAM.
 
     Prunes from BOTH:
@@ -47,8 +47,13 @@ def prune_output_dict(inference_state, current_frame_idx,
     # Multiplex path: output_dict lives inside sam2_inference_states
     sam2_states = inference_state.get("sam2_inference_states", [])
     if sam2_states:
+        # Pass outer protected frames to inner states so confidence-injected
+        # frames are not pruned from inner output_dicts
+        outer_protected = inference_state.get("_shiva_protected_frames", set())
         total = {"pruned": 0, "kept_landmarks": 0, "retained_total": 0}
         for inner_state in sam2_states:
+            # Propagate outer protection to inner state for this prune cycle
+            inner_state["_shiva_protected_frames"] = outer_protected
             result = _prune_single_state(
                 inner_state, current_frame_idx,
                 max_recent_frames, max_landmark_frames,

@@ -1137,7 +1137,15 @@ class Sam3MultiplexBase(Sam3VideoBase):
             _suppress = getattr(self, '_shiva_sentinel_status', 'GREEN') != 'GREEN'
             # Also suppress if any identity verifier pair is mid-crossing
             _crossing_states = getattr(self, '_shiva_crossing_active', False)
-            if _suppress or _crossing_states:
+            # Immediate IoU check: suppress if any detection-track pair has
+            # high IoU overlap, catching the first crossing frame before
+            # SENTINEL updates (SENTINEL lags by one frame)
+            _immediate_overlap = False
+            if adt_result is not None and hasattr(adt_result, 'iou_matrix'):
+                _iou_mx = adt_result.iou_matrix
+                if _iou_mx is not None and _iou_mx.numel() > 0:
+                    _immediate_overlap = bool(_iou_mx.max() > 0.3)
+            if _suppress or _crossing_states or _immediate_overlap:
                 should_recondition_periodic = False
                 should_recondition_iou = False
 

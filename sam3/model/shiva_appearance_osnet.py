@@ -133,11 +133,14 @@ class ShivaOSNetAppearanceStore:
 
         return embedding.astype(np.float64)
 
-    def update(self, obj_id, embedding, max_update_distance=None):
+    def update(self, obj_id, embedding, max_update_distance=None,
+               crossing_active=False):
         """Update track's appearance model with EMA.
 
         Skips update if new embedding diverges too much (possible swap).
-        Force-resets after too many consecutive rejections.
+        Force-resets after too many consecutive rejections — but only when
+        no crossing is active (during crossings, current embedding is
+        contaminated by overlapping animals).
         """
         if embedding is None:
             return
@@ -164,7 +167,8 @@ class ShivaOSNetAppearanceStore:
                 self._consecutive_rejects[obj_id] = (
                     self._consecutive_rejects.get(obj_id, 0) + 1
                 )
-                if self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects:
+                if (self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects
+                        and not crossing_active):
                     self.embeddings[obj_id] = embedding.copy()
                     self._consecutive_rejects[obj_id] = 0
                     logger.info(

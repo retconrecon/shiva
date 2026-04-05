@@ -91,7 +91,8 @@ class ShivaAppearanceStore:
         self._consecutive_rejects = {}  # {obj_id: int}
         self._max_consecutive_rejects = max_consecutive_rejects
 
-    def update(self, obj_id, histogram, max_update_distance=0.4):
+    def update(self, obj_id, histogram, max_update_distance=0.4,
+               crossing_active=False):
         """Update track's appearance model with exponential moving average.
 
         Skips the update if the new histogram diverges too much from the
@@ -100,7 +101,10 @@ class ShivaAppearanceStore:
 
         If updates are rejected for too many consecutive frames (e.g., after
         an undetected swap or lighting change), force-resets the embedding
-        from the current observation to unstick it.
+        from the current observation to unstick it — but ONLY when no
+        crossing is active. During crossings, the current embedding is a
+        blend of overlapping animals and force-reset would lock in the
+        wrong identity.
         """
         if obj_id not in self.embeddings:
             self.embeddings[obj_id] = histogram.copy()
@@ -120,8 +124,11 @@ class ShivaAppearanceStore:
                     self._consecutive_rejects.get(obj_id, 0) + 1
                 )
                 # Force-reset after too many consecutive rejects to unstick
-                # embeddings frozen by undetected swaps or lighting changes
-                if self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects:
+                # embeddings frozen by undetected swaps or lighting changes.
+                # Suppress during crossings — current observation is likely
+                # contaminated by overlapping animals.
+                if (self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects
+                        and not crossing_active):
                     self.embeddings[obj_id] = histogram.copy()
                     self._consecutive_rejects[obj_id] = 0
                     logger.info(

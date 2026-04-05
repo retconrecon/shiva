@@ -79,10 +79,14 @@ class ShivaTracker:
         '_shiva_sentinel_status', '_shiva_crossing_active',
         'use_botsort_association', '_shiva_appearance_store',
         '_shiva_frame_pixels', '_prev_non_overlap_assignment',
+        '_prev_non_overlap_batch_size',
         '_shiva_diag_logged', '_shiva_nonoverlap_diag_logged',
         'occlusion_memory_freeze', 'occlusion_freeze_threshold',
         'temporal_boundary_prior', '_tiab_module',
         '_tiab_appearance_embs', '_tiab_centroid_history',
+        '_tiab_expected_B', '_tiab_prior_warned',
+        # Extraction hook attrs (tiab_extract.py)
+        '_tiab_extractor', '_tiab_extract_buffer', '_tiab_original_encode',
     ]
 
     def __exit__(self, *exc):
@@ -112,6 +116,8 @@ class ShivaTracker:
                  confidence_injection=False, confidence_threshold=0.3,
                  occlusion_memory_freeze=False, occlusion_freeze_threshold=0.5,
                  temporal_boundary_prior=0.0,
+                 tiab_enabled=False, tiab_checkpoint=None,
+                 tiab_appearance_dim=512, tiab_trajectory_len=16,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -206,6 +212,31 @@ class ShivaTracker:
             )
             logger.info("Confidence injection enabled (threshold=%.2f)", confidence_threshold)
 
+        # Initialize TIAB boundary refinement module
+        self.tiab_enabled = tiab_enabled
+        self._tiab_trajectory_len = tiab_trajectory_len
+        self._tiab_appearance_dim = tiab_appearance_dim
+        self._centroid_history = {}  # {oid: deque of (cx_norm, cy_norm)}
+        if tiab_enabled:
+            from sam3.model.tiab import TemporalIdentityBoundaryModule
+            tiab_module = TemporalIdentityBoundaryModule(
+                appearance_dim=tiab_appearance_dim,
+                trajectory_len=tiab_trajectory_len,
+            )
+            if tiab_checkpoint is not None:
+                ckpt = torch.load(tiab_checkpoint, map_location="cpu", weights_only=True)
+                state_dict = ckpt.get("model_state_dict", ckpt)
+                tiab_module.load_state_dict(state_dict)
+                logger.info("TIAB weights loaded from %s", tiab_checkpoint)
+            tiab_module = tiab_module.cuda().eval()
+            # Attach to inner model where _encode_new_memory reads it
+            _inner = self._model
+            if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+                _inner = self._model.tracker.model
+            _inner._tiab_module = tiab_module
+            logger.info("TIAB boundary refinement enabled (%d params)",
+                        sum(p.numel() for p in tiab_module.parameters()))
+
         self.prune_stats = []
         self._applied_swaps = set()  # deduplication for apply_swap
 
@@ -265,6 +296,22 @@ class ShivaTracker:
         if n_frames is not None:
             request["max_frame_num_to_track"] = n_frames
 
+        # Initialize TIAB attributes with zeros for frame 0.
+        # Frame 0's _encode_new_memory runs before we see any output,
+        # so we need placeholder attributes. Real values are set after
+        # each frame via _update_tiab_attributes.
+        if self.tiab_enabled and self._model is not None:
+            _inner = self._model
+            if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+                _inner = self._model.tracker.model
+            device = next(_inner._tiab_module.parameters()).device
+            _inner._tiab_appearance_embs = torch.zeros(
+                self.n_animals, self._tiab_appearance_dim, device=device,
+            )
+            _inner._tiab_centroid_history = torch.full(
+                (self.n_animals, self._tiab_trajectory_len, 2), 0.5, device=device,
+            )
+
         # Wrap generator so exceptions trigger cleanup — an aborted run
         # would otherwise leave inference_state dirty.
         _seeded_areas = False
@@ -316,7 +363,10 @@ class ShivaTracker:
                                     break
                             if _has_overlap:
                                 break
-                    if not _has_overlap:
+                    # Force-seed after 100 frames even with overlap — dense
+                    # scenes may never have a clean frame, and no seeding
+                    # disables recovery entirely.
+                    if not _has_overlap or frame_idx >= 100:
                         initial = {
                             oid: int(m.sum()) for oid, m in frame_bool.items()
                             if int(m.sum()) > self.pixel_paint.min_fish_area
@@ -324,6 +374,12 @@ class ShivaTracker:
                         if initial:
                             self.pixel_paint.set_initial_areas(initial)
                             _seeded_areas = True
+                            if _has_overlap and frame_idx >= 100:
+                                logger.warning(
+                                    "Force-seeded area fingerprints at frame %d "
+                                    "despite overlap (no clean frame in first 100)",
+                                    frame_idx,
+                                )
 
                 # Update median areas from raw masks (before BFS completion)
                 if self.pixel_paint is not None and frame_bool:
@@ -398,7 +454,11 @@ class ShivaTracker:
                                 if other_emb is None:
                                     continue
                                 other_dist = _dist_fn(cur_emb, other_emb)
-                                if other_dist < own_dist - 0.05:
+                                # Relative check: mismatch if closer to any
+                                # other object than to own. No absolute margin
+                                # — works for same-species where all distances
+                                # are close but relative ordering still matters.
+                                if other_dist < own_dist:
                                     identity_mismatch = True
                                     break
                             if identity_mismatch:
@@ -442,31 +502,34 @@ class ShivaTracker:
                             self.pixel_paint.update_last_centroid(oid, cx, cy)
 
                     # Inject recovery masks into SAM3.1's memory so future frames
-                    # attend to corrected masks, not the bad ones. Without this,
-                    # pixel-paint recovery is cosmetic only (consumer sees recovery
-                    # but SAM3.1 keeps propagating from the bad mask).
+                    # attend to corrected masks, not the bad ones. Batched into a
+                    # single add_new_masks + consolidate call to avoid O(N) encoder
+                    # passes (4 simultaneous recoveries = 1 pass instead of 4).
                     if recovery_masks and self.injector is None:
                         _inner = self._model
                         if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
                             _inner = self._model.tracker.model
                         if hasattr(_inner, 'add_new_masks'):
-                            for oid, rmask in recovery_masks.items():
-                                try:
-                                    mask_t = torch.from_numpy(rmask.astype(np.float32)).unsqueeze(0).to('cuda')
-                                    _inner.add_new_masks(
-                                        inference_state=self._inference_state,
-                                        frame_idx=frame_idx,
-                                        obj_ids=[oid],
-                                        masks=mask_t,
-                                    )
-                                    _inner._consolidate_temp_output_across_obj(
-                                        inference_state=self._inference_state,
-                                        frame_idx=frame_idx,
-                                        is_cond=False,
-                                        run_mem_encoder=True,
-                                    )
-                                except Exception as e:
-                                    logger.debug("Recovery mask injection failed for oid %d: %s", oid, e)
+                            try:
+                                all_oids = sorted(recovery_masks.keys())
+                                all_masks = torch.stack([
+                                    torch.from_numpy(recovery_masks[oid].astype(np.float32)).unsqueeze(0)
+                                    for oid in all_oids
+                                ]).to('cuda')
+                                _inner.add_new_masks(
+                                    inference_state=self._inference_state,
+                                    frame_idx=frame_idx,
+                                    obj_ids=all_oids,
+                                    masks=all_masks,
+                                )
+                                _inner._consolidate_temp_output_across_obj(
+                                    inference_state=self._inference_state,
+                                    frame_idx=frame_idx,
+                                    is_cond=False,
+                                    run_mem_encoder=True,
+                                )
+                            except Exception as e:
+                                logger.debug("Batched recovery injection failed: %s", e)
 
                 # Confidence-triggered mid-tracking mask injection
                 # Pass recovery_masks so injector doesn't claim blobs already
@@ -503,6 +566,13 @@ class ShivaTracker:
                         self._model._shiva_crossing_active = any(
                             s != "clear" for s in states.values()
                         )
+
+                # Update TIAB per-frame attributes for the NEXT frame's
+                # _encode_new_memory. Must happen after centroid extraction
+                # (so history is current) and before yield (so attributes
+                # are set when the generator advances to the next frame).
+                if self.tiab_enabled and self._model is not None:
+                    self._update_tiab_attributes(frame_bool, frame_bgr)
 
                 yield frame_idx, outputs, recovery_masks, swap_events
         except Exception:
@@ -627,7 +697,108 @@ class ShivaTracker:
                 oid_a, oid_b, e,
             )
 
+        # Swap TIAB centroid history so trajectory conditioning
+        # reflects the corrected identity assignment
+        if self.tiab_enabled:
+            h_a = self._centroid_history.get(oid_a)
+            h_b = self._centroid_history.get(oid_b)
+            if h_a is not None:
+                self._centroid_history[oid_b] = h_a
+            elif oid_b in self._centroid_history:
+                del self._centroid_history[oid_b]
+            if h_b is not None:
+                self._centroid_history[oid_a] = h_b
+            elif oid_a in self._centroid_history:
+                del self._centroid_history[oid_a]
+
         logger.info("Applied swap: oid %d <-> %d", oid_a, oid_b)
+
+    def _update_tiab_attributes(self, frame_bool, frame_bgr):
+        """Set per-frame TIAB attributes on the inner model.
+
+        Updates _tiab_appearance_embs and _tiab_centroid_history so the
+        next frame's _encode_new_memory can run TIAB boundary refinement.
+        """
+        from collections import deque
+
+        _inner = self._model
+        if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+            _inner = self._model.tracker.model
+
+        if not hasattr(_inner, '_tiab_module') or _inner._tiab_module is None:
+            return
+
+        # Use SAM3.1's obj_id_to_idx ordering if available to match
+        # the batch dimension in pred_masks_high_res. Fall back to sorted
+        # oids if the inner state doesn't expose the mapping.
+        _obj_id_to_idx = None
+        for s in self._inference_state.get("sam2_inference_states", []):
+            if "obj_id_to_idx" in s:
+                _obj_id_to_idx = s["obj_id_to_idx"]
+                break
+        if _obj_id_to_idx is not None:
+            # Order oids by their SAM3.1 batch index
+            oids = sorted(
+                [oid for oid in frame_bool if oid in _obj_id_to_idx],
+                key=lambda o: _obj_id_to_idx[o],
+            )
+        else:
+            oids = sorted(frame_bool.keys())
+        B = len(oids)
+        if B == 0:
+            _inner._tiab_appearance_embs = None
+            _inner._tiab_centroid_history = None
+            return
+
+        K = self._tiab_trajectory_len
+        device = next(_inner._tiab_module.parameters()).device
+
+        # Get image dimensions for normalizing centroids
+        h = self._inference_state.get("orig_height", 1008)
+        w = self._inference_state.get("orig_width", 1008)
+
+        # Update centroid history per object using largest-component centroid
+        # (matches eval's _largest_component_centroid, not naive mean)
+        for oid in oids:
+            mask = frame_bool[oid]
+            cx, cy = ShivaPixelPaintRecovery._largest_component_centroid(mask)
+            if cx is not None:
+                cx_norm = cx / w
+                cy_norm = cy / h
+            else:
+                cx_norm, cy_norm = 0.5, 0.5
+
+            if oid not in self._centroid_history:
+                self._centroid_history[oid] = deque(maxlen=K)
+            self._centroid_history[oid].append((cx_norm, cy_norm))
+
+        # Build centroid history tensor [B, K, 2]
+        history = torch.zeros(B, K, 2, device=device)
+        for i, oid in enumerate(oids):
+            h_list = list(self._centroid_history.get(oid, [(0.5, 0.5)]))
+            # Pad with earliest position if not enough history
+            while len(h_list) < K:
+                h_list.insert(0, h_list[0])
+            h_list = h_list[-K:]
+            history[i] = torch.tensor(h_list, device=device)
+
+        _inner._tiab_centroid_history = history
+
+        # Build appearance embeddings [B, D]
+        # Use the appearance store if available, otherwise zeros
+        appear = torch.zeros(B, self._tiab_appearance_dim, device=device)
+        store = getattr(self, '_appearance_store', None)
+        if store is not None and frame_bgr is not None:
+            for i, oid in enumerate(oids):
+                emb = store.extract_embedding(frame_bool[oid], frame_bgr)
+                if emb is not None:
+                    # Pad or truncate to appearance_dim
+                    emb_t = torch.from_numpy(np.asarray(emb, dtype=np.float32)).to(device)
+                    dim = min(emb_t.shape[0], self._tiab_appearance_dim)
+                    appear[i, :dim] = emb_t[:dim]
+
+        _inner._tiab_appearance_embs = appear
+        _inner._tiab_expected_B = B
 
     @staticmethod
     def _compute_pairwise_ious(bool_masks):
