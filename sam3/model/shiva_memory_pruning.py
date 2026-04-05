@@ -76,12 +76,29 @@ def prune_output_dict(inference_state, current_frame_idx,
     )
 
 
+_HEAVY_KEYS = ("maskmem_features", "maskmem_pos_enc", "pred_masks_high_res",
+               "image_features")
+
+
 def _prune_single_state(inference_state, current_frame_idx,
                          max_recent_frames, max_landmark_frames):
     """Prune a single inference state's output dicts."""
     main_non_cond = inference_state.get("output_dict", {}).get(
         "non_cond_frame_outputs", {}
     )
+
+    # Trim heavy tensors from frames beyond the memory attention window.
+    # SAM3.1 only retrieves maskmem_features from the last num_maskmem (7)
+    # frames. Older frames only need pred_masks + obj_ptr + scores (~90KB
+    # instead of ~12MB). This is the same trim SAM3.1 does when
+    # trim_past_non_cond_mem_for_eval=True, but applied unconditionally.
+    trim_cutoff = current_frame_idx - 8  # num_maskmem + 1 buffer
+    for f in list(main_non_cond.keys()):
+        if f >= trim_cutoff:
+            continue
+        entry = main_non_cond[f]
+        for key in _HEAVY_KEYS:
+            entry.pop(key, None)
 
     if len(main_non_cond) <= max_recent_frames + max_landmark_frames:
         return None
