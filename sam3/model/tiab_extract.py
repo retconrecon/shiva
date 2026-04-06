@@ -1,138 +1,87 @@
-"""TIAB feature extraction — hooks into SAM3.1 tracking to capture
-per-frame tensors needed for TIAB training.
+"""TIAB feature extraction — captures per-frame tensors from inside
+SAM3.1's _encode_new_memory for TIAB training.
 
-Sets a callback on the inner tracker model that fires inside
-_encode_new_memory, capturing pred_masks (before non-overlap constraint)
-and pix_feat (backbone features at stride 16).
+Uses a callback attribute (_tiab_extract_callback) on the inner tracker
+model, called directly from _encode_new_memory in video_tracking_multiplex.py.
+No monkey-patching — the callback is a first-class integration point.
 
 Usage in experiment scripts:
-    from sam3.model.tiab_extract import setup_extraction, teardown_extraction
 
-    # After start_session, before propagation:
+    from sam3.model.tiab_extract import TIABExtractionSession
+    from sam3.model.tiab_dataset import TIABExtractor
+
     extractor = TIABExtractor(save_dir, gt_data, n_animals)
-    setup_extraction(predictor, session_id, extractor)
 
-    # Normal tracking loop
-    for result in predictor.handle_stream_request({...}):
-        frame_idx = result["frame_index"]
-        obj_ids = result["outputs"]["out_obj_ids"]
-        masks = result["outputs"]["out_binary_masks"]
-        # Convert masks to bool dict for the extractor
-        output_masks = {}
-        for i, oid in enumerate(obj_ids):
-            m = masks[i].cpu().numpy().squeeze().astype(bool) if hasattr(masks[i], 'cpu') else masks[i].squeeze().astype(bool)
-            output_masks[int(oid)] = m
-        extractor.capture_output(frame_idx, output_masks, obj_ids)
+    with TIABExtractionSession(predictor, session_id, extractor) as extract:
+        for result in predictor.handle_stream_request({...}):
+            frame_idx = result["frame_index"]
+            obj_ids = result["outputs"]["out_obj_ids"]
+            masks = result["outputs"]["out_binary_masks"]
+            output_masks = {int(oid): masks[i].cpu().numpy().squeeze().astype(bool)
+                           for i, oid in enumerate(obj_ids)}
+            extract.on_frame(frame_idx, output_masks, obj_ids)
 
-    teardown_extraction(predictor, session_id)
-    extractor.finalize()
+    # extractor.finalize() is called automatically by __exit__
 """
 
-import torch
-from sam3.model.tiab_dataset import TIABExtractor
 
+class TIABExtractionSession:
+    """Manages the extraction callback lifecycle on the inner tracker model.
 
-def setup_extraction(predictor, session_id, extractor):
-    """Install extraction hook on the inner tracker model.
-
-    Sets a callback that fires inside _encode_new_memory to capture
-    pred_masks_high_res and pix_feat before the non-overlap constraint.
-    """
-    session = predictor._all_inference_states.get(session_id, {})
-    state = session.get("state", {})
-
-    # Find the inner model (where _encode_new_memory runs)
-    model = predictor.model
-    inner = model
-    if hasattr(model, 'tracker') and hasattr(model.tracker, 'model'):
-        inner = model.tracker.model
-
-    # Store the extractor and a buffer for pre-constraint tensors
-    inner._tiab_extractor = extractor
-    inner._tiab_extract_buffer = {}
-
-    # Monkey-patch _encode_new_memory to capture tensors
-    original_encode = inner._encode_new_memory.__func__
-
-    def patched_encode(self, image, current_vision_feats, feat_sizes,
-                       pred_masks_high_res, object_score_logits,
-                       is_mask_from_pts, **kwargs):
-        # Capture pre-constraint tensors
-        ext = getattr(self, '_tiab_extractor', None)
-        buf = getattr(self, '_tiab_extract_buffer', None)
-        if ext is not None and buf is not None:
-            B = current_vision_feats[-1].size(1)
-            C = self.hidden_dim
-            H, W = feat_sizes[-1]
-            pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
-            buf["pred_masks"] = pred_masks_high_res.detach()
-            buf["pix_feat"] = pix_feat.detach()
-            buf["object_scores"] = object_score_logits.detach()
-
-        return original_encode(
-            self, image, current_vision_feats, feat_sizes,
-            pred_masks_high_res, object_score_logits,
-            is_mask_from_pts, **kwargs,
-        )
-
-    import types
-    inner._encode_new_memory = types.MethodType(patched_encode, inner)
-    inner._tiab_original_encode = original_encode
-
-    print("TIAB extraction hook installed")
-
-
-def teardown_extraction(predictor, session_id):
-    """Remove extraction hook and restore original _encode_new_memory."""
-    model = predictor.model
-    inner = model
-    if hasattr(model, 'tracker') and hasattr(model.tracker, 'model'):
-        inner = model.tracker.model
-
-    original = getattr(inner, '_tiab_original_encode', None)
-    if original is not None:
-        import types
-        inner._encode_new_memory = types.MethodType(original, inner)
-
-    for attr in ('_tiab_extractor', '_tiab_extract_buffer', '_tiab_original_encode'):
-        if hasattr(inner, attr):
-            delattr(inner, attr)
-
-    print("TIAB extraction hook removed")
-
-
-class ExtractionCapture:
-    """Helper that bridges the tracking loop output with the extractor.
-
-    The extraction hook captures pre-constraint tensors inside
-    _encode_new_memory. This class captures the post-tracking output
-    (masks, obj_ids) and calls the extractor with both.
+    Sets _tiab_extract_callback on the inner model, which is called from
+    _encode_new_memory with (pred_masks, pix_feat, object_scores) before
+    the non-overlap constraint. The callback buffers these tensors; on_frame()
+    pairs them with the tracking loop's output masks and saves to disk.
     """
 
-    def __init__(self, extractor, inner_model):
+    def __init__(self, predictor, session_id, extractor):
+        self.predictor = predictor
+        self.session_id = session_id
         self.extractor = extractor
-        self.inner = inner_model
+        self._buffer = {}
+
+        # Find the inner model where _encode_new_memory runs
+        model = predictor.model
+        self._inner = model
+        if hasattr(model, 'tracker') and hasattr(model.tracker, 'model'):
+            self._inner = model.tracker.model
+
+        # Install the callback
+        def _capture(pred_masks, pix_feat, object_scores):
+            self._buffer = {
+                "pred_masks": pred_masks,
+                "pix_feat": pix_feat,
+                "object_scores": object_scores,
+            }
+
+        self._inner._tiab_extract_callback = _capture
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        # Remove callback
+        if hasattr(self._inner, '_tiab_extract_callback'):
+            del self._inner._tiab_extract_callback
+        self.extractor.finalize()
 
     def on_frame(self, frame_idx, output_masks, obj_ids):
-        """Called per frame in the tracking loop after yield.
+        """Called per frame from the tracking loop after yield.
 
-        Args:
-            frame_idx: current frame
-            output_masks: dict {oid: bool_mask}
-            obj_ids: list of object IDs from SAM3.1 output
+        Pairs the buffered internal tensors (from _encode_new_memory)
+        with the external output masks and saves via the extractor.
         """
-        buf = getattr(self.inner, '_tiab_extract_buffer', {})
-        if not buf:
+        if not self._buffer:
             return
 
         self.extractor.on_frame(
             frame_idx=frame_idx,
-            pred_masks_pre_constraint=buf.get("pred_masks"),
-            pix_feat=buf.get("pix_feat"),
-            object_score_logits=buf.get("object_scores"),
+            pred_masks_pre_constraint=self._buffer["pred_masks"],
+            pix_feat=self._buffer["pix_feat"],
+            object_score_logits=self._buffer["object_scores"],
             output_masks=output_masks,
-            obj_ids=obj_ids,
+            obj_ids=list(int(x) for x in obj_ids),
         )
 
-        # Clear buffer
-        self.inner._tiab_extract_buffer = {}
+        # Clear buffer for next frame
+        self._buffer = {}

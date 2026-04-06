@@ -85,7 +85,8 @@ class ShivaTracker:
         'temporal_boundary_prior', '_tiab_module',
         '_tiab_appearance_embs', '_tiab_centroid_history',
         '_tiab_expected_B', '_tiab_prior_warned',
-        # Extraction hook attrs (tiab_extract.py)
+        # Extraction callback + legacy hook attrs
+        '_tiab_extract_callback',
         '_tiab_extractor', '_tiab_extract_buffer', '_tiab_original_encode',
     ]
 
