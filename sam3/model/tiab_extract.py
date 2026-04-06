@@ -41,16 +41,23 @@ class TIABExtractionSession:
         self._buffer = {}
 
         # Find the object where _encode_new_memory runs during propagation.
-        # The multiplex propagation path calls self._encode_new_memory() at
-        # video_tracking_multiplex.py:2491, where self is the
-        # VideoTrackingMultiplexDemo instance (predictor.model.tracker.model).
-        # The callback must be set on THIS object.
+        # Sam3MultiplexPredictorWrapper inherits _encode_new_memory from
+        # Sam3TrackerBase via its parent class. When the wrapper calls
+        # self._encode_new_memory(), self is the WRAPPER, not the inner model
+        # (despite __getattr__ proxying — inheritance takes priority over
+        # __getattr__). The callback must be set on the wrapper AND the
+        # inner model to cover both code paths (STB and VTM).
         model = predictor.model
-        self._inner = model
-        if hasattr(model, 'tracker') and hasattr(model.tracker, 'model'):
-            self._inner = model.tracker.model
+        self._targets = []
+        if hasattr(model, 'tracker'):
+            self._targets.append(model.tracker)  # wrapper (STB path)
+            if hasattr(model.tracker, 'model'):
+                self._targets.append(model.tracker.model)  # inner (VTM path)
+        else:
+            self._targets.append(model)
+        self._inner = self._targets[0]
 
-        # Install the callback
+        # Install the callback on ALL targets
         def _capture(pred_masks, pix_feat, object_scores):
             self._buffer = {
                 "pred_masks": pred_masks,
@@ -58,15 +65,17 @@ class TIABExtractionSession:
                 "object_scores": object_scores,
             }
 
-        self._inner._tiab_extract_callback = _capture
+        for target in self._targets:
+            target._tiab_extract_callback = _capture
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        # Remove callback
-        if hasattr(self._inner, '_tiab_extract_callback'):
-            del self._inner._tiab_extract_callback
+        # Remove callback from all targets
+        for target in self._targets:
+            if hasattr(target, '_tiab_extract_callback'):
+                del target._tiab_extract_callback
         self.extractor.finalize()
 
     def on_frame(self, frame_idx, output_masks, obj_ids):
