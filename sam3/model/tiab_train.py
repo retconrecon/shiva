@@ -58,6 +58,8 @@ def train_tiab(
     # Data
     crossing_ratio=0.7,
     image_size=1008,
+    # Phase control
+    phase=1,  # 1 = trajectory only, 2 = appearance + trajectory
     # Device
     device="cuda",
     # Checkpointing
@@ -106,19 +108,23 @@ def train_tiab(
         contest_margin=contest_margin,
     ).to(device)
 
-    # Phase 1: drop appearance so model learns trajectory-only identity.
-    # appear_proj weights stay at init, ready for Phase 2 fine-tuning.
-    model.identity_encoder.drop_appearance = True
+    if phase == 1:
+        # Phase 1: drop appearance so model learns trajectory-only identity.
+        model.identity_encoder.drop_appearance = True
+        print(f"TIAB parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print("Phase 1: appearance dropped — training trajectory-only identity")
+        # Exclude appear_proj from optimization (weights stay at init for Phase 2)
+        appear_proj_ids = set(id(p) for p in model.identity_encoder.appear_proj.parameters())
+        train_params = [p for p in model.parameters() if id(p) not in appear_proj_ids]
+    else:
+        # Phase 2: appearance + trajectory. All parameters trained.
+        model.identity_encoder.drop_appearance = False
+        print(f"TIAB parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print("Phase 2: appearance + trajectory — full identity signal")
+        train_params = list(model.parameters())
 
-    print(f"TIAB parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("Phase 1: appearance dropped — training trajectory-only identity")
-
-    # Optimizer — exclude appear_proj from optimization in Phase 1
-    # (its weights should stay at initialization for Phase 2)
-    appear_proj_ids = set(id(p) for p in model.identity_encoder.appear_proj.parameters())
-    phase1_params = [p for p in model.parameters() if id(p) not in appear_proj_ids]
     optimizer = torch.optim.AdamW(
-        phase1_params, lr=lr, weight_decay=weight_decay,
+        train_params, lr=lr, weight_decay=weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs,

@@ -49,7 +49,7 @@ class TIABExtractor:
         save_dir,
         gt_data,
         n_animals,
-        crossing_iou_thresh=0.05,
+        crossing_distance_thresh=50.0,
         non_crossing_sample_rate=0.1,
         image_size=1008,
     ):
@@ -66,7 +66,7 @@ class TIABExtractor:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.gt_data = gt_data
         self.n_animals = n_animals
-        self.crossing_iou_thresh = crossing_iou_thresh
+        self.crossing_distance_thresh = crossing_distance_thresh
         self.non_crossing_sample_rate = non_crossing_sample_rate
         self.image_size = image_size
         self._frame_count = 0
@@ -95,15 +95,24 @@ class TIABExtractor:
         """
         self._frame_count += 1
 
-        # Determine if crossing (any pairwise mask IoU > threshold)
+        # Determine if crossing via centroid distance (not mask IoU — output
+        # masks are non-overlapping by construction after SAM3.1's argmax,
+        # so IoU is always 0).
         is_crossing = False
-        masks_list = list(output_masks.values())
-        if len(masks_list) >= 2:
-            for i in range(len(masks_list)):
-                for j in range(i + 1, len(masks_list)):
-                    intersection = (masks_list[i] & masks_list[j]).sum()
-                    union = (masks_list[i] | masks_list[j]).sum()
-                    if union > 0 and intersection / union > self.crossing_iou_thresh:
+        oids = sorted(output_masks.keys())
+        if len(oids) >= 2:
+            centroids = {}
+            for oid in oids:
+                ys, xs = np.where(output_masks[oid])
+                if len(xs) > 0:
+                    centroids[oid] = (float(xs.mean()), float(ys.mean()))
+            clist = list(centroids.values())
+            for i in range(len(clist)):
+                for j in range(i + 1, len(clist)):
+                    dx = clist[i][0] - clist[j][0]
+                    dy = clist[i][1] - clist[j][1]
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist < self.crossing_distance_thresh:
                         is_crossing = True
                         break
                 if is_crossing:
