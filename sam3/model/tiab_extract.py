@@ -41,13 +41,14 @@ class TIABExtractionSession:
         self._buffer = {}
 
         # Find the object where _encode_new_memory runs during propagation.
-        # The propagation path goes through Sam3TrackerPredictor (predictor.model.tracker),
-        # which inherits _encode_new_memory from Sam3TrackerBase — NOT the
-        # VideoTrackingMultiplex version on predictor.model.tracker.model.
+        # The multiplex propagation path calls self._encode_new_memory() at
+        # video_tracking_multiplex.py:2491, where self is the
+        # VideoTrackingMultiplexDemo instance (predictor.model.tracker.model).
+        # The callback must be set on THIS object.
         model = predictor.model
         self._inner = model
-        if hasattr(model, 'tracker'):
-            self._inner = model.tracker
+        if hasattr(model, 'tracker') and hasattr(model.tracker, 'model'):
+            self._inner = model.tracker.model
 
         # Install the callback
         def _capture(pred_masks, pix_feat, object_scores):
