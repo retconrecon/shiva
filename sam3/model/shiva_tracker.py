@@ -392,6 +392,15 @@ class ShivaTracker:
                 if self.pixel_paint is not None and frame_bgr is not None and frame_bool:
                     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
                     not_water = self.pixel_paint._get_not_water(gray)
+                    # Resize not_water to match mask resolution if needed
+                    # (bg model is built at disk resolution, masks are at SAM3.1 resolution)
+                    _sample_mask = next(iter(frame_bool.values()))
+                    if not_water.shape != _sample_mask.shape:
+                        not_water = cv2.resize(
+                            not_water.astype(np.uint8),
+                            (_sample_mask.shape[1], _sample_mask.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                     frame_bool = ShivaPixelPaintRecovery.complete_masks_with_foreground(
                         frame_bool, not_water,
                     )
