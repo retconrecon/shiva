@@ -1648,13 +1648,17 @@ class VideoTrackingMultiplex(nn.Module):
                     and _tiab_history is not None
                     and _tiab_B == _model_B):
                 # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
-                pred_masks_high_res = _tiab(
-                    pred_masks=pred_masks_high_res.squeeze(1),
-                    pix_feat=pix_feat,
-                    appearance_embs=_tiab_appearance,
-                    centroid_history=_tiab_history,
-                    object_score_logits=object_score_logits,
-                ).unsqueeze(1)
+                # Disable autocast and cast inputs to float32 to avoid
+                # bfloat16/float32 dtype mismatches in scatter operations.
+                _orig_dtype = pred_masks_high_res.dtype
+                with torch.amp.autocast('cuda', enabled=False):
+                    pred_masks_high_res = _tiab(
+                        pred_masks=pred_masks_high_res.squeeze(1).float(),
+                        pix_feat=pix_feat.float(),
+                        appearance_embs=_tiab_appearance.float(),
+                        centroid_history=_tiab_history.float(),
+                        object_score_logits=object_score_logits.float(),
+                    ).unsqueeze(1).to(_orig_dtype)
                 _tiab_handled = True
 
         if self.non_overlap_masks_for_mem_enc and not self.training and not _tiab_handled:
