@@ -233,6 +233,12 @@ def train_tiab(
                     device=device,
                 )
 
+                # Guard all inputs against NaN
+                pm = torch.nan_to_num(pm, nan=0.0)
+                pf = torch.nan_to_num(pf, nan=0.0)
+                ch = torch.nan_to_num(ch, nan=0.5)
+                appear_embs = torch.nan_to_num(appear_embs, nan=0.0)
+
                 # Forward — disable autocast to avoid bfloat16/float32 mismatches
                 # in scatter operations (refinement[:, contested_mask] = adjustments)
                 with torch.amp.autocast('cuda', enabled=False):
