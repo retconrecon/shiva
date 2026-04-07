@@ -153,13 +153,16 @@ def train_tiab(
         # Balanced sampling each epoch
         sampler_indices = dataset.get_balanced_sampler()
         sampler = SubsetRandomSampler(sampler_indices)
+        # num_workers=0 avoids shared-memory resize errors with
+        # variable-size tensors (different object counts per frame).
+        # batch_size=1 sidesteps stacking; the inner loop handles
+        # per-sample processing.
         loader = DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=1,
             sampler=sampler,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
+            num_workers=0,
+            pin_memory=False,
         )
 
         epoch_losses = {
