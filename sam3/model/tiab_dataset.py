@@ -211,12 +211,19 @@ class TIABDataset(Dataset):
             with open(meta_path) as f:
                 meta = json.load(f)
 
+            # Read crossing labels from per-frame .pt files (authoritative),
+            # falling back to meta.json crossing_frames list if .pt unavailable
             crossing_set = set(meta.get("crossing_frames", []))
 
             frame_files = sorted(data_dir.glob("frame_*.pt"))
             for ff in frame_files:
                 fidx = int(ff.stem.split("_")[1])
-                is_cross = fidx in crossing_set
+                # Read is_crossing directly from the .pt file
+                try:
+                    _fd = torch.load(ff, map_location="cpu", weights_only=False)
+                    is_cross = bool(_fd.get("is_crossing", fidx in crossing_set))
+                except Exception:
+                    is_cross = fidx in crossing_set
                 idx = len(self._all_frames)
                 self._all_frames.append((str(data_dir), fidx, is_cross))
                 self._frames_by_dir[str(data_dir)].append(idx)
