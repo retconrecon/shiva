@@ -832,14 +832,9 @@ class Sam3TrackerBase(torch.nn.Module):
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
 
-        # TIAB extraction: capture pre-constraint tensors for training data.
-        _extract_cb = getattr(self, '_tiab_extract_callback', None)
-        if _extract_cb is not None:
-            _extract_cb(
-                pred_masks=pred_masks_high_res.detach(),
-                pix_feat=pix_feat.detach(),
-                object_scores=object_score_logits.detach(),
-            )
+        # TIAB extraction callback removed from STB — only VTM version fires
+        # during tracking. STB fires during consolidation where tensor format
+        # differs, causing [5184, 0, 256] crash.
 
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
