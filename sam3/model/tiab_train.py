@@ -253,10 +253,11 @@ def train_tiab(
                 if (diff < model.contest_margin).sum() > 0:
                     n_contested += 1
 
-                # Compute loss
+                # Compute loss — pass only valid (non-NaN) GT centroids
+                # to prevent NaN from poisoning torch.cdist
                 loss, loss_dict = tiab_combined_loss(
                     refined_masks=refined,
-                    gt_centroids=gt_c,
+                    gt_centroids=gt_valid,
                     id_map=id_map,
                     gt_masks=None,  # No pixel-level GT in Phase 1
                     gate_values=model.gate(
