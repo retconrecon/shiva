@@ -184,6 +184,11 @@ def train_tiab(
 
             for i in range(pred_masks.size(0)):
                 pm = pred_masks[i]  # [B_obj, H, W]
+                # Convert binary masks (0/1) to logits (-10/+10) if needed.
+                # Extraction saves output masks as float 0.0/1.0, but TIAB
+                # expects raw logits where the scale determines contested pixels.
+                if pm.max() <= 1.0 and pm.min() >= 0.0:
+                    pm = pm * 20.0 - 10.0  # 0 → -10, 1 → +10
                 pf = pix_feat[i]    # [B_obj, C, Hf, Wf]
                 os_ = object_scores[i]  # [B_obj]
                 gt_c = gt_centroids[i]  # [N, 2]
