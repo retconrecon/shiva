@@ -1024,7 +1024,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
         det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
         det_scores: Tensor = det_out["scores"].float()
         # SHIVA: store frame pixels for BoT-SORT appearance extraction
-        if self.use_botsort_association and feature_cache is not None and frame_idx in feature_cache:
+        if getattr(self, 'use_botsort_association', False) and feature_cache is not None and frame_idx in feature_cache:
             frame_tensor = feature_cache[frame_idx][0]  # model-input tensor (normalized)
             if frame_tensor is not None:
                 from sam3.model.shiva_tracker import denormalize_feature_cache_to_bgr
@@ -1134,7 +1134,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
         # reconditioning uses raw IoU argmax which can override BoT-SORT's
         # identity-aware assignment — suppress reconditioning when identity
         # is ambiguous (SENTINEL non-GREEN or any crossing in progress)
-        if self.use_botsort_association:
+        if getattr(self, 'use_botsort_association', False):
             _suppress = getattr(self, '_shiva_sentinel_status', 'GREEN') != 'GREEN'
             # Also suppress if any identity verifier pair is mid-crossing
             _crossing_states = getattr(self, '_shiva_crossing_active', False)

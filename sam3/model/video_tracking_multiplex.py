@@ -1647,6 +1647,9 @@ class VideoTrackingMultiplex(nn.Module):
             if (_tiab_appearance is not None
                     and _tiab_history is not None
                     and _tiab_B == _model_B):
+                if not getattr(self, '_tiab_fired_once', False):
+                    print(f"    [TIAB] ACTIVATED: B={_model_B}, first frame")
+                    self._tiab_fired_once = True
                 # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
                 # Disable autocast and cast inputs to float32 to avoid
                 # bfloat16/float32 dtype mismatches in scatter operations.
