@@ -191,8 +191,9 @@ def train_tiab(
                 # Hard argmax masks have clean interiors but arbitrary boundaries.
                 # Add noise at boundary pixels so TIAB learns to correct them.
                 if pm.max() <= 1.0 and pm.min() >= 0.0:
-                    # Base logits: 0 → -5, 1 → +5
-                    pm = pm * 10.0 - 5.0
+                    # Base logits: 0 → -1, 1 → +1 (small gap so boundary
+                    # noise creates real contention within contest_margin=2.0)
+                    pm = pm * 2.0 - 1.0
                     # Find boundary: pixels where any neighbor differs
                     boundary = torch.zeros_like(pm, dtype=torch.bool)
                     for obj_idx in range(pm.shape[0]):
