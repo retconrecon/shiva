@@ -173,11 +173,11 @@ def train_tiab(
         n_contested = 0
 
         for batch in loader:
-            pred_masks = batch["pred_masks"].to(device)
-            pix_feat = batch["pix_feat"].to(device)
-            object_scores = batch["object_scores"].to(device)
-            gt_centroids = batch["gt_centroids"].to(device)
-            centroid_history = batch["centroid_history"].to(device)
+            pred_masks = batch["pred_masks"].to(device=device, dtype=torch.float32)
+            pix_feat = batch["pix_feat"].to(device=device, dtype=torch.float32)
+            object_scores = batch["object_scores"].to(device=device, dtype=torch.float32)
+            gt_centroids = batch["gt_centroids"].to(device=device, dtype=torch.float32)
+            centroid_history = batch["centroid_history"].to(device=device, dtype=torch.float32)
             is_crossing = batch["is_crossing"]
 
             # Process each sample in the batch independently
