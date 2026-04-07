@@ -184,11 +184,11 @@ def train_tiab(
 
             for i in range(pred_masks.size(0)):
                 pm = pred_masks[i]  # [B_obj, H, W]
-                # Convert binary masks (0/1) to logits (-10/+10) if needed.
-                # Extraction saves output masks as float 0.0/1.0, but TIAB
-                # expects raw logits where the scale determines contested pixels.
+                # Use binary masks directly with soft logits.
+                # Hard 0/1 → soft 0.1/0.9 so boundary pixels have
+                # small score differences that TIAB can learn to refine.
                 if pm.max() <= 1.0 and pm.min() >= 0.0:
-                    pm = pm * 20.0 - 10.0  # 0 → -10, 1 → +10
+                    pm = pm * 0.8 + 0.1  # 0 → 0.1, 1 → 0.9
                 pf = pix_feat[i]    # [B_obj, C, Hf, Wf]
                 os_ = object_scores[i]  # [B_obj]
                 gt_c = gt_centroids[i]  # [N, 2]
@@ -258,7 +258,7 @@ def train_tiab(
                     image_size=image_size,
                     lambda_identity=lambda_identity,
                     lambda_boundary=lambda_boundary,
-                    lambda_gate=lambda_gate,
+                    lambda_gate=0.0,  # Disable gate sparsity — let gate learn from identity loss gradient
                 )
 
                 batch_loss = batch_loss + loss
