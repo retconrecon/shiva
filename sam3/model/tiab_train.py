@@ -199,23 +199,27 @@ def train_tiab(
                 if B_obj <= 1:
                     continue
 
-                # Skip if GT has NaN (incomplete annotation)
-                if torch.isnan(gt_c).any():
-                    continue
+                # Filter GT to only fish with valid (non-NaN) annotations
+                valid_gt = {j: gt_c[j] for j in range(gt_c.size(0))
+                            if not torch.isnan(gt_c[j]).any()}
+                if len(valid_gt) < 2:
+                    continue  # Need at least 2 GT fish for contrastive loss
 
                 # Build identity map via Hungarian matching between
-                # predicted mask centroids and GT centroids. SAM3.1's object
-                # ordering has no guaranteed correspondence to GT animal IDs.
+                # predicted mask centroids and valid GT centroids only.
                 with torch.no_grad():
                     pred_cents = mask_centroid(torch.sigmoid(pm)).cpu().numpy()
-                gt_np = (gt_c / image_size).cpu().numpy()
-                n_match = min(B_obj, gt_np.shape[0])
-                cost = np.zeros((n_match, n_match))
-                for ri in range(n_match):
-                    for ci in range(n_match):
+                valid_ids = sorted(valid_gt.keys())
+                gt_valid = torch.stack([valid_gt[j] for j in valid_ids])
+                gt_np = (gt_valid / image_size).cpu().numpy()
+                n_pred = min(B_obj, len(valid_ids))
+                n_gt = len(valid_ids)
+                cost = np.zeros((n_pred, n_gt))
+                for ri in range(n_pred):
+                    for ci in range(n_gt):
                         cost[ri, ci] = np.sqrt(((pred_cents[ri] - gt_np[ci]) ** 2).sum())
                 row_ind, col_ind = linear_sum_assignment(cost)
-                id_map = {int(r): int(c) for r, c in zip(row_ind, col_ind)}
+                id_map = {int(r): int(valid_ids[c]) for r, c in zip(row_ind, col_ind)}
 
                 # Zero appearance embeddings for Phase 1 so the model learns
                 # to rely on trajectory, not noise. Random embeddings would
