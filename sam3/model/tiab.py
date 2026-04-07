@@ -268,6 +268,10 @@ class TemporalIdentityBoundaryModule(nn.Module):
             appearance_embs, centroid_history,
         )  # [B, identity_dim]
 
+        # Expand pix_feat if shared backbone (B=1) to match per-object batch
+        if pix_feat.shape[0] == 1 and B > 1:
+            pix_feat = pix_feat.expand(B, -1, -1, -1)
+
         # Step 3: Operate at feature resolution to avoid 512MB upsample.
         # Downsample contested mask to pix_feat resolution, run attention
         # there (~3MB instead of ~512MB), then bilinear-upsample the
