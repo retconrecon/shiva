@@ -348,6 +348,17 @@ class ShivaPixelPaintRecovery:
             )
             return {}
 
+        # Resize not_water to match mask resolution if needed
+        # (bg model at disk resolution, masks at SAM3.1 internal resolution)
+        if healthy_masks:
+            _sample = next(iter(healthy_masks.values()))
+            if not_water.shape != _sample.shape:
+                not_water = cv2.resize(
+                    not_water.astype(np.uint8),
+                    (_sample.shape[1], _sample.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+
         # Subtract healthy masks (with dilation to avoid edge noise)
         unclaimed = not_water.copy()
         for oid, mask in healthy_masks.items():
