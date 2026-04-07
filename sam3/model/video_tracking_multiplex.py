@@ -1634,19 +1634,6 @@ class VideoTrackingMultiplex(nn.Module):
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
 
-        # TIAB extraction: capture pre-constraint tensors for training data.
-        # Fires before non-overlap constraint so pred_masks are raw logits.
-        _extract_cb = getattr(self, '_tiab_extract_callback', None)
-        if _extract_cb is not None:
-            try:
-                _extract_cb(
-                    pred_masks=pred_masks_high_res.clone().detach(),
-                    pix_feat=pix_feat.clone().detach(),
-                    object_scores=object_score_logits.clone().detach(),
-                )
-            except Exception:
-                pass  # never let extraction crash tracking
-
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
