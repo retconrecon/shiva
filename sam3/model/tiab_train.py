@@ -187,11 +187,29 @@ def train_tiab(
 
             for i in range(pred_masks.size(0)):
                 pm = pred_masks[i]  # [B_obj, H, W]
-                # Use binary masks directly with soft logits.
-                # Hard 0/1 → soft 0.1/0.9 so boundary pixels have
-                # small score differences that TIAB can learn to refine.
+                # Convert binary masks to synthetic logits with boundary noise.
+                # Hard argmax masks have clean interiors but arbitrary boundaries.
+                # Add noise at boundary pixels so TIAB learns to correct them.
                 if pm.max() <= 1.0 and pm.min() >= 0.0:
-                    pm = pm * 0.8 + 0.1  # 0 → 0.1, 1 → 0.9
+                    # Base logits: 0 → -5, 1 → +5
+                    pm = pm * 10.0 - 5.0
+                    # Find boundary: pixels where any neighbor differs
+                    boundary = torch.zeros_like(pm, dtype=torch.bool)
+                    for obj_idx in range(pm.shape[0]):
+                        obj_mask = (pm[obj_idx] > 0)
+                        # Dilate - erode = boundary
+                        dilated = torch.nn.functional.max_pool2d(
+                            obj_mask.float().unsqueeze(0).unsqueeze(0),
+                            3, stride=1, padding=1,
+                        ).squeeze().bool()
+                        eroded = ~torch.nn.functional.max_pool2d(
+                            (~obj_mask).float().unsqueeze(0).unsqueeze(0),
+                            3, stride=1, padding=1,
+                        ).squeeze().bool()
+                        boundary[obj_idx] |= (dilated & ~eroded)
+                    # Add noise at boundary pixels (simulate uncertain boundaries)
+                    noise = torch.randn_like(pm) * 2.0  # std=2.0
+                    pm = pm + noise * boundary.float()
                 pf = pix_feat[i]    # [B_obj, C, Hf, Wf]
                 os_ = object_scores[i]  # [B_obj]
                 gt_c = gt_centroids[i]  # [N, 2]
