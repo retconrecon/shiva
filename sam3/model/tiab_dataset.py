@@ -264,7 +264,9 @@ class TIABDataset(Dataset):
         gt_centroids = frame_data["gt_centroids"].float()
 
         # Normalized centroids for loss computation
-        gt_centroids_norm = gt_centroids / self.image_size
+        # NaN stays in gt_centroids (training loop filters with valid_gt)
+        # but centroid_norm must be clean for any downstream use
+        gt_centroids_norm = torch.nan_to_num(gt_centroids, nan=0.0) / self.image_size
 
         B = pred_masks.size(0)
 
@@ -311,6 +313,7 @@ class TIABDataset(Dataset):
                     map_location="cpu", weights_only=False,
                 )
                 gt = fd["gt_centroids"].float() / self.image_size
+                gt = torch.nan_to_num(gt, nan=0.5)  # replace NaN with center
                 loaded.append(gt[:n_objects])
             except Exception:
                 continue
