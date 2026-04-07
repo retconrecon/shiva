@@ -146,6 +146,8 @@ class ShivaPixelPaintRecovery:
 
     def _get_not_water(self, gray):
         """Background subtraction -> binary not-water mask."""
+        if gray.shape != self.bg_median.shape:
+            gray = cv2.resize(gray, (self.bg_median.shape[1], self.bg_median.shape[0]))
         diff = np.abs(gray.astype(np.float32) - self.bg_median)
         not_water = diff > (self.bg_std * self.bg_std_multiplier + self.bg_additive_offset)
         mask_u8 = not_water.astype(np.uint8)
