@@ -247,7 +247,7 @@ class TIABDataset(Dataset):
             is_crossing: bool
             centroid_history: [B, K, 2] float32 (placeholder — filled by collate)
         """
-        data_dir, frame_idx, is_crossing = self._all_frames[idx]
+        data_dir, frame_idx, is_crossing = self._all_frames[int(idx)]
         frame_path = Path(data_dir) / f"frame_{frame_idx:06d}.pt"
         frame_data = torch.load(frame_path, map_location="cpu", weights_only=False)
 
@@ -346,6 +346,6 @@ class TIABDataset(Dataset):
             size=min(n_noncrossing, len(self._noncrossing_indices)),
             replace=len(self._noncrossing_indices) < n_noncrossing,
         )
-        indices = np.concatenate([crossing, noncrossing])
+        indices = np.concatenate([crossing, noncrossing]).astype(int)
         rng.shuffle(indices)
-        return indices.tolist()
+        return [int(x) for x in indices]
