@@ -1638,11 +1638,14 @@ class VideoTrackingMultiplex(nn.Module):
         # Fires before non-overlap constraint so pred_masks are raw logits.
         _extract_cb = getattr(self, '_tiab_extract_callback', None)
         if _extract_cb is not None:
-            _extract_cb(
-                pred_masks=pred_masks_high_res.detach(),
-                pix_feat=pix_feat.detach(),
-                object_scores=object_score_logits.detach(),
-            )
+            try:
+                _extract_cb(
+                    pred_masks=pred_masks_high_res.clone().detach(),
+                    pix_feat=pix_feat.clone().detach(),
+                    object_scores=object_score_logits.clone().detach(),
+                )
+            except Exception:
+                pass  # never let extraction crash tracking
 
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
