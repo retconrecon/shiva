@@ -796,8 +796,9 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 input_batch.img_batch.tensors[frame_idx],
                 backbone_cache,
             )
-        # remove from `feature_cache` old features to save GPU memory
-        feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+        # Feature cache cleanup is handled by _prune_outer_state in
+        # shiva_memory_pruning.py. Eager pop here prevents TIAB extraction
+        # from reading the current frame's features after yield.
         return det_out, pos_pred_mask
 
     def run_tracker_propagation(
