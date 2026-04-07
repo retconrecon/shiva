@@ -77,6 +77,16 @@ class BoundaryAttention(nn.Module):
         # Identity query: single vector per object → global context
         # O(n_contested) instead of O(n_contested²)
         id_query = self.identity_proj(identity_embs).unsqueeze(1)  # [B, 1, hidden]
+
+        # Debug: log shapes on first call
+        if not getattr(self, '_shape_logged', False):
+            import logging
+            logging.getLogger(__name__).info(
+                f"BoundaryAttention shapes: query={id_query.shape} "
+                f"key={contested_feats.shape} pix_feat_in={pixel_features.shape} "
+                f"n_contested={n_contested}")
+            self._shape_logged = True
+
         context, _ = self.cross_attn(
             id_query, contested_feats, contested_feats,
         )  # [B, 1, hidden]
