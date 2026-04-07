@@ -233,14 +233,16 @@ def train_tiab(
                     device=device,
                 )
 
-                # Forward
-                refined = model(
-                    pred_masks=pm,
-                    pix_feat=pf,
-                    appearance_embs=appear_embs,
-                    centroid_history=ch,
-                    object_score_logits=os_.unsqueeze(-1) if os_.dim() == 1 else os_,
-                )
+                # Forward — disable autocast to avoid bfloat16/float32 mismatches
+                # in scatter operations (refinement[:, contested_mask] = adjustments)
+                with torch.amp.autocast('cuda', enabled=False):
+                    refined = model(
+                        pred_masks=pm,
+                        pix_feat=pf,
+                        appearance_embs=appear_embs,
+                        centroid_history=ch,
+                        object_score_logits=os_.unsqueeze(-1) if os_.dim() == 1 else os_,
+                    )
 
                 # Check if any pixels were contested
                 if B_obj == 2:
