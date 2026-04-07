@@ -1928,8 +1928,8 @@ class Sam3MultiplexBase(Sam3VideoBase):
 
         # SHIVA: dispatch to BoT-SORT association when enabled
         if (
-            self.use_botsort_association
-            and self._shiva_appearance_store is not None
+            getattr(self, 'use_botsort_association', False)
+            and getattr(self, '_shiva_appearance_store', None) is not None
             and trk_masks.size(0) > 0
             and det_masks.size(0) > 0
         ):
