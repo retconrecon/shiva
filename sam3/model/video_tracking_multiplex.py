@@ -1634,7 +1634,30 @@ class VideoTrackingMultiplex(nn.Module):
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
 
-        if self.non_overlap_masks_for_mem_enc and not self.training:
+        # TIAB: learned identity-aware boundary refinement.
+        # Runs independently of non_overlap_masks_for_mem_enc — TIAB applies
+        # its own non-overlap constraint via _hard_argmax.
+        _tiab = getattr(self, '_tiab_module', None)
+        _tiab_handled = False
+        if _tiab is not None and not self.training:
+            _tiab_appearance = getattr(self, '_tiab_appearance_embs', None)
+            _tiab_history = getattr(self, '_tiab_centroid_history', None)
+            _tiab_B = getattr(self, '_tiab_expected_B', -1)
+            _model_B = pred_masks_high_res.size(0)
+            if (_tiab_appearance is not None
+                    and _tiab_history is not None
+                    and _tiab_B == _model_B):
+                # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
+                pred_masks_high_res = _tiab(
+                    pred_masks=pred_masks_high_res.squeeze(1),
+                    pix_feat=pix_feat,
+                    appearance_embs=_tiab_appearance,
+                    centroid_history=_tiab_history,
+                    object_score_logits=object_score_logits,
+                ).unsqueeze(1)
+                _tiab_handled = True
+
+        if self.non_overlap_masks_for_mem_enc and not self.training and not _tiab_handled:
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
             # the objects come from the same video under batch size 1).
@@ -1645,44 +1668,9 @@ class VideoTrackingMultiplex(nn.Module):
             if _freeze:
                 _pre_clamp_areas = (pred_masks_high_res > 0).flatten(1).sum(dim=1).float()
 
-            # TIAB: learned identity-aware boundary refinement (replaces argmax)
-            _tiab = getattr(self, '_tiab_module', None)
-            if _tiab is not None and not getattr(self, '_tiab_prior_warned', False):
-                _prior = getattr(self, 'temporal_boundary_prior', 0.0)
-                if _prior > 0:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        "TIAB active with temporal_boundary_prior=%.2f — "
-                        "prior is bypassed when TIAB handles boundary refinement", _prior)
-                self._tiab_prior_warned = True
-            if _tiab is not None:
-                _tiab_appearance = getattr(self, '_tiab_appearance_embs', None)
-                _tiab_history = getattr(self, '_tiab_centroid_history', None)
-                _tiab_B = getattr(self, '_tiab_expected_B', -1)
-                _model_B = pred_masks_high_res.size(0)
-                # Only run TIAB when attributes are set AND batch dimension
-                # matches. Object add/remove changes B between when attrs
-                # were set (after yield) and when _encode_new_memory runs
-                # (during next frame's forward). Mismatch → fall back to argmax.
-                if (_tiab_appearance is not None
-                        and _tiab_history is not None
-                        and _tiab_B == _model_B):
-                    # pred_masks_high_res is [B, 1, H, W]; TIAB operates on [B, H, W]
-                    pred_masks_high_res = _tiab(
-                        pred_masks=pred_masks_high_res.squeeze(1),
-                        pix_feat=pix_feat,
-                        appearance_embs=_tiab_appearance,
-                        centroid_history=_tiab_history,
-                        object_score_logits=object_score_logits,
-                    ).unsqueeze(1)
-                else:
-                    pred_masks_high_res = self._apply_non_overlapping_constraints(
-                        pred_masks_high_res
-                    )
-            else:
-                pred_masks_high_res = self._apply_non_overlapping_constraints(
-                    pred_masks_high_res
-                )
+            pred_masks_high_res = self._apply_non_overlapping_constraints(
+                pred_masks_high_res
+            )
 
             # SHIVA memory freeze: detect objects whose mask was severely
             # clamped by non-overlap constraints. Zero their mask contribution
