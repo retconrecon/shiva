@@ -109,6 +109,12 @@ class ShivaTracker:
             })
         except Exception as e:
             logger.debug("Session close failed: %s", e)
+        # Break reference cycles so GC can free session memory.
+        self._inference_state = None
+        self._model = None
+        self.pixel_paint = None
+        self.verifier = None
+        self.injector = None
 
     def __init__(self, predictor, session_id, frame_dir, n_animals,
                  max_recent_frames=500, max_landmark_frames=50,
