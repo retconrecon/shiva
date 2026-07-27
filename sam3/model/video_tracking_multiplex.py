@@ -1634,6 +1634,32 @@ class VideoTrackingMultiplex(nn.Module):
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
 
+        # TIAB TRAINING-DATA EXTRACTION HOOK (restored 2026-07-27).
+        #
+        # `tiab_extract.TIABExtractionSession` SETS `_tiab_extract_callback` on this model (:69) and
+        # deletes it on exit (:78), and its docstring states the callback "is called from
+        # _encode_new_memory in video_tracking_multiplex.py ... with (pred_masks, pix_feat,
+        # object_scores) before the non-overlap constraint". THAT CALL SITE DID NOT EXIST. The
+        # attribute appeared only in tiab_extract.py and in ShivaTracker's cleanup list, so
+        # extraction silently captured nothing and TIAB could not be trained with the shipped code.
+        #
+        # This restores the documented integration point, with the documented signature, at the
+        # documented position (pix_feat is computed just above; the non-overlap constraint is
+        # below). Guarded by getattr, so with no extraction session active this is a single
+        # attribute lookup per frame and the tracker is byte-unchanged.
+        _extract_cb = getattr(self, '_tiab_extract_callback', None)
+        if _extract_cb is not None:
+            try:
+                _extract_cb(pred_masks_high_res, pix_feat, object_score_logits)
+            except Exception as _exc:                                    # noqa: BLE001
+                # Extraction is instrumentation: it must never take down a tracking run. Report
+                # once and continue - a silent failure here is what produced an empty extract dir.
+                if not getattr(self, '_tiab_extract_warned', False):
+                    print(f"[tiab_extract] callback raised ({type(_exc).__name__}: {_exc}); "
+                          f"extraction DISABLED for the rest of this run", flush=True)
+                    self._tiab_extract_warned = True
+                    self._tiab_extract_callback = None
+
         # TIAB: learned identity-aware boundary refinement.
         # Runs independently of non_overlap_masks_for_mem_enc — TIAB applies
         # its own non-overlap constraint via _hard_argmax.
