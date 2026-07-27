@@ -275,7 +275,7 @@ class ShivaTracker:
                 vmin, vmax, _DENORM_MEAN, _DENORM_STD,
             )
 
-    def track(self, n_frames=None, propagation_direction="forward"):
+    def track(self, n_frames=None, propagation_direction="forward", start_frame_idx=None):
         """Run SAM3.1 propagation with SHIVA hooks.
 
         Yields:
@@ -294,11 +294,24 @@ class ShivaTracker:
                 if hasattr(self, attr):
                     setattr(_inner, attr, getattr(self, attr))
 
+        # start_frame_idx: where propagation ORIGINATES. Hardcoded 0 until 2026-07-26, which is only
+        # correct when the prompt is also on frame 0. When the seed lands later (our official-SAM3.1
+        # seeds are on frames 0/2/3/4/10/32), propagating from 0 means the frames before the prompt
+        # are produced without a valid prompt and are discarded downstream - so a video seeded at
+        # frame N loses its first N frames outright.
+        #
+        # Passing the SEED frame here, with propagation_direction="both", makes the tracker run
+        # forward to the end AND backward to frame 0 from the same anchor - the frames before the
+        # seed are then genuinely tracked rather than dropped. Semi-supervised VOS is time-symmetric
+        # in exactly this way; SAM2/SAM3 support it natively (sam3_base_predictor.py:278-285).
+        #
+        # DEFAULT None PRESERVES THE PREVIOUS BEHAVIOUR EXACTLY (start_frame_index: 0), so this is
+        # opt-in and every existing run remains byte-reproducible.
         request = {
             "type": "propagate_in_video",
             "session_id": self.session_id,
             "propagation_direction": propagation_direction,
-            "start_frame_index": 0,
+            "start_frame_index": 0 if start_frame_idx is None else int(start_frame_idx),
         }
         if n_frames is not None:
             request["max_frame_num_to_track"] = n_frames
