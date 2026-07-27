@@ -1619,6 +1619,35 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 existing_masklet_video_res_masks = existing_masklet_video_res_masks[
                     :num_ids
                 ]
+        # SHIVA_PIXELWISE_PARTITION: split contested pixels on TRUE per-pixel evidence.
+        #
+        # THE PROBLEM THIS FIXES. Mutual exclusion currently happens one stage LATER, in
+        # `_apply_object_wise_non_overlapping_constraints` (sam3_multiplex_tracking.py:749), whose
+        # input is already boolean (`assert out_binary_masks.dtype == torch.bool`, :707). By then
+        # the per-pixel logits are gone, so that function substitutes each pixel's score with its
+        # OBJECT's scalar score before the argmax - making the contest degenerate: in any contested
+        # region the higher-scoring animal takes 100% of the pixels and the other loses 100%.
+        #
+        # Here, one line before binarisation, `existing_masklet_video_res_masks` is still [N,1,H,W]
+        # LOGITS. Running the true per-pixel argmax now splits the contested region on real
+        # evidence, and the later object-wise pass becomes a no-op because no overlaps remain.
+        #
+        # `self.tracker` resolves through this class's `__getattr__` proxy (:174-179) to the inner
+        # model's `_apply_non_overlapping_constraints` (video_tracking_multiplex.py:2658). That
+        # function early-returns unchanged when N==1, and its `temporal_boundary_prior` branch is
+        # dormant (default 0.0), so it neither reads nor writes `_prev_non_overlap_assignment` -
+        # which matters, because that state is otherwise cross-contaminated by a discarded call at
+        # video_tracking_multiplex_demo.py:1926.
+        #
+        # ENV-GATED so a single build serves both A/B arms: an unset variable is byte-identical to
+        # the previous behaviour, and control vs variant differ only in this flag, never in the
+        # compiled artifact. Default OFF.
+        if os.environ.get("SHIVA_PIXELWISE_PARTITION", "0") == "1":
+            existing_masklet_video_res_masks = (
+                self.tracker._apply_non_overlapping_constraints(
+                    existing_masklet_video_res_masks
+                )
+            )
         existing_masklet_binary = existing_masklet_video_res_masks > 0
         for obj_id, mask in zip(existing_masklet_obj_ids, existing_masklet_binary):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
