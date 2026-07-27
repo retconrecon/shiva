@@ -170,7 +170,7 @@ class RefinementGate(nn.Module):
     - ~1 on crossing frames (apply TIAB refinement)
     """
 
-    def __init__(self, identity_dim=128):
+    def __init__(self, identity_dim=128, init_gate_bias=-4.0):
         super().__init__()
         self.gate = nn.Sequential(
             nn.Linear(identity_dim + 1, 64),
@@ -178,6 +178,21 @@ class RefinementGate(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
+        # ☢ INITIALISE THE GATE CLOSED. With PyTorch's default init the final Linear outputs ~0, so
+        # Sigmoid gives ~0.5 and the module applies ~55% of a COMPLETELY RANDOM refinement to every
+        # object on every frame before it has learned anything (measured: mean gate 0.5453 over 2000
+        # random inputs). That is why an untrained TIAB does not merely fail to help, it actively
+        # corrupts masks - and why `ZEUS_TIAB=1` has always been worse than leaving TIAB off.
+        #
+        # Biasing the pre-sigmoid to -4 puts the gate at ~0.02, so at initialisation the module is
+        # effectively PASS-THROUGH (refined = pred_masks + 0.02 * refinement) and is therefore
+        # equivalent to TIAB=0 up to a negligible perturbation. Training can then only open the gate
+        # where the loss says intervening helps. This makes "trained >= untrained" a property of the
+        # PARAMETERISATION rather than something we have to hope the optimiser discovers.
+        #
+        # Same trick as a near-zero-initialised residual branch (ResNet `zero_init_residual`, Fixup)
+        # and the standard large-negative bias on a sigmoid gate: start at the identity function.
+        nn.init.constant_(self.gate[2].bias, init_gate_bias)
 
     def forward(self, identity_embs, object_scores):
         """
