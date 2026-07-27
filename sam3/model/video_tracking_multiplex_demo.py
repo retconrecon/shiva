@@ -2902,6 +2902,27 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
             else:
                 raise ValueError(f"conditioning objects not found at {frame_idx=}")
 
+        # `_encode_new_memory` takes neither frame_idx nor object ids, but TIAB's optional output
+        # publication needs both (see the `_tiab_refined_out` block there). Publish them
+        # immediately before the call; this is the only site that knows them and reaches that code.
+        #
+        # IDs matter more than the frame here. The memory path and the output path do NOT carry the
+        # same object set - the output path drops zero-area, suppressed, removed and unconfirmed
+        # objects (sam3_multiplex_tracking.py:708-730) while the memory path does not. Aligning the
+        # two by ROW POSITION would therefore silently mis-assign masks between animals, which is
+        # exactly the identity swap TIAB exists to prevent. So the consumer aligns by ID and
+        # refuses to apply anything it cannot match exactly.
+        #
+        # Sorted because `_tracker_update_memories` orders its slices by ascending obj_id
+        # (sam3_multiplex_base.py:2603-2610), whereas `inference_state["obj_ids"]` is in insertion
+        # order. Those coincide in practice but that is a coincidence of two independent
+        # conventions, not an invariant, so we normalise rather than rely on it. The length check
+        # in the consumer catches the case where they diverge.
+        self._tiab_frame_hint = int(frame_idx)
+        try:
+            self._tiab_obj_ids_hint = sorted(int(o) for o in inference_state["obj_ids"])
+        except Exception:                                                # noqa: BLE001
+            self._tiab_obj_ids_hint = None
         maskmem_features, maskmem_pos_enc = self._encode_new_memory(
             image=image,
             current_vision_feats=propagation_vision_feats,

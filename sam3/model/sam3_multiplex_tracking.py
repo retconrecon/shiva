@@ -704,6 +704,48 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 [obj_id_to_mask[obj_id] for obj_id in curr_obj_ids], dim=0
             )
 
+            # TIAB -> OUTPUT (opt-in, default off). Without this the module's refinement reaches
+            # only the memory bank: `_encode_new_memory` returns just
+            # (maskmem_features, maskmem_pos_enc), so a perfectly trained TIAB could never change
+            # an emitted mask. See `_tiab_refined_out` in video_tracking_multiplex.py.
+            #
+            # FAIL CLOSED. Applied only when the stash is for THIS frame and its object ids match
+            # `curr_obj_ids` EXACTLY. The memory path and this path carry different object sets
+            # (below, this function drops zero-area / suppressed / removed / unconfirmed objects),
+            # so a positional splice would hand animal A's mask to animal B - the precise identity
+            # swap TIAB is meant to prevent. On any mismatch we keep the original masks and warn
+            # once, rather than emit a plausible-looking but mis-assigned result.
+            # Resolve the INNER model. `self.tracker` is a Sam3MultiplexTrackerPredictor whose
+            # __getattr__ proxies READS to `.model`, but an assignment would bind on the wrapper -
+            # so clearing the stash via `self.tracker` would leave the producer's attribute set and
+            # permanently shadow it with the wrapper's None. Resolve once and use it for both.
+            _inner = getattr(self.tracker, "model", self.tracker)
+            _stash = getattr(_inner, "_tiab_refined_out", None)
+            if _stash is not None:
+                _sf, _sids, _srefined = _stash
+                _inner._tiab_refined_out = None            # consume exactly once
+                # `_postprocess_output` does not receive frame_idx, so gate on it only when `out`
+                # carries one. The load-bearing guard is the ID equality below, not the frame.
+                _fidx = out.get("frame_idx", None) if isinstance(out, dict) else None
+                _frame_ok = (_fidx is None) or (int(_fidx) == int(_sf))
+                if _frame_ok and list(_sids) == list(curr_obj_ids):
+                    # TIAB works at the memory encoder's resolution (interpol_size, 1152^2);
+                    # the emitted mask is at video resolution. Resample the LOGITS, then
+                    # threshold - thresholding first would alias the boundary we just refined.
+                    _r = _srefined.float()
+                    if _r.dim() == 4:
+                        _r = _r.squeeze(1)
+                    _r = torch.nn.functional.interpolate(
+                        _r.unsqueeze(1), size=(H_video, W_video),
+                        mode="bilinear", align_corners=False,
+                    ).squeeze(1)
+                    out_binary_masks = (_r > 0).to(out_binary_masks.device)
+                elif not getattr(_inner, "_tiab_out_warned", False):
+                    print(f"    [TIAB->out] SKIPPED: stash frame={_sf} ids={list(_sids)} vs "
+                          f"output frame={_fidx} ids={list(curr_obj_ids)}. "
+                          f"Keeping unrefined masks (fail-closed).")
+                    _inner._tiab_out_warned = True
+
             assert out_binary_masks.dtype == torch.bool
             keep = out_binary_masks.any(dim=(1, 2)).cpu()  # remove masks with 0 areas
             # hide outputs for those object IDs in `obj_ids_to_hide`

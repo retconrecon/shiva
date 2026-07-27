@@ -125,6 +125,7 @@ class ShivaTracker:
                  temporal_boundary_prior=0.0,
                  tiab_enabled=False, tiab_checkpoint=None,
                  tiab_appearance_dim=512, tiab_trajectory_len=16,
+                 tiab_to_output=False,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -241,8 +242,13 @@ class ShivaTracker:
             if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
                 _inner = self._model.tracker.model
             _inner._tiab_module = tiab_module
-            logger.info("TIAB boundary refinement enabled (%d params)",
-                        sum(p.numel() for p in tiab_module.parameters()))
+            # Opt-in: let the refinement reach the EMITTED mask, not just the memory bank.
+            # `_encode_new_memory` returns only (maskmem_features, maskmem_pos_enc), so with this
+            # off a perfectly trained TIAB can influence accuracy only indirectly, one frame late,
+            # via memory conditioning. Set on the same `_inner` the producer writes to.
+            _inner._tiab_to_output = bool(tiab_to_output)
+            logger.info("TIAB boundary refinement enabled (%d params, to_output=%s)",
+                        sum(p.numel() for p in tiab_module.parameters()), bool(tiab_to_output))
 
         self.prune_stats = []
         self._applied_swaps = set()  # deduplication for apply_swap

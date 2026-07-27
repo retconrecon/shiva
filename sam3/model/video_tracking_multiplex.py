@@ -1690,6 +1690,44 @@ class VideoTrackingMultiplex(nn.Module):
                     ).unsqueeze(1).to(_orig_dtype)
                 _tiab_handled = True
 
+                # ☢ PUBLISH THE REFINEMENT SO THE OUTPUT PATH CAN CONSUME IT.
+                #
+                # Without this, TIAB CANNOT AFFECT THE EMITTED MASK AT ALL. This function returns
+                # only (maskmem_features, maskmem_pos_enc) at the end, and the line above rebinds a
+                # LOCAL name - the caller's tensor is untouched. The emitted mask is built
+                # separately in `build_outputs` (sam3_multiplex_base.py:1601-1653) from
+                # `tracker_low_res_masks_global`, which this function only ever READ. So a
+                # perfectly-trained TIAB could previously influence accuracy only indirectly, one
+                # frame late, through memory conditioning.
+                #
+                # Ordering makes the stash safe: `_tracker_update_memories`
+                # (sam3_multiplex_base.py:1222) runs BEFORE `build_outputs` (:1601) within the same
+                # frame, so a value published here is available to the consumer this frame.
+                #
+                # Keyed by frame index and consumed exactly once, so a stale refinement can never be
+                # applied to the wrong frame - TIAB fires more than once per frame on some paths
+                # (pixel-paint recovery re-enters via _consolidate_temp_output_across_obj), and an
+                # unkeyed stash would let a recovery-pass refinement leak into the next frame.
+                #
+                # `_encode_new_memory` does NOT receive frame_idx (see its signature), so the frame
+                # is published by the caller as `_tiab_frame_hint` - `_run_memory_encoder` has it.
+                # A missing hint (-1) means we cannot prove which frame this belongs to, so we
+                # publish nothing rather than risk applying a refinement to the wrong frame.
+                #
+                # DEFAULT OFF. Enabling changes what every reported number means, so it is gated and
+                # must be reported as its own arm.
+                if getattr(self, '_tiab_to_output', False):
+                    _hint = int(getattr(self, '_tiab_frame_hint', -1))
+                    _ids = getattr(self, '_tiab_obj_ids_hint', None)
+                    # Publish only when the frame AND a per-row object id list are both known and
+                    # the id count matches the tensor's batch. Anything less and the consumer could
+                    # not prove which mask belongs to which animal, so we publish nothing: a missing
+                    # refinement costs us the experiment arm, a misaligned one corrupts identity.
+                    if _hint >= 0 and _ids is not None and len(_ids) == pred_masks_high_res.size(0):
+                        self._tiab_refined_out = (
+                            _hint, list(_ids), pred_masks_high_res.detach()
+                        )
+
         if self.non_overlap_masks_for_mem_enc and not self.training and not _tiab_handled:
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
