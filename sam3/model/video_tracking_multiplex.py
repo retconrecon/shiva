@@ -2516,6 +2516,41 @@ class VideoTrackingMultiplex(nn.Module):
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
+
+        # ☢ PER-FRAME TIAB EXTRACTION HOOK. This is BLOCKER 5.
+        #
+        # The documented extraction hook lives in `_encode_new_memory`, but that function does NOT
+        # run once per frame on this path: propagation is driven with `run_mem_encoder=False`
+        # (sam3_multiplex_base.py:1779) and memory encoding happens later and globally in
+        # `_tracker_update_memories`. MEASURED on mouse045: the memory-encoder callback fired on
+        # 170 of 2713 frames = 6.27%, which after the extractor's 10% non-crossing sampling left
+        # 21 shards (0.77%). That 6.27% is a CEILING imposed upstream - no sampling rate can lift
+        # it, so restoring the dead hook was necessary but not sufficient to build a training set.
+        #
+        # `_track_step_aux` DOES run every frame - it is the per-frame tracking step, and only the
+        # memory encoder inside it is gated. Capturing here therefore sees every frame, and it also
+        # has `frame_idx` directly in scope (which `_encode_new_memory` does not), so a captured
+        # sample can never be misattributed to the wrong frame.
+        #
+        # Captured tensors match the documented contract exactly: high-res mask logits BEFORE the
+        # non-overlap constraint, the top-level backbone feature reshaped to [B, C, H, W] the same
+        # way `_encode_new_memory` does it, and the object score logits.
+        _pf_cb = getattr(self, "_tiab_perframe_callback", None)
+        if _pf_cb is not None and propagation_vision_feats is not None:
+            try:
+                _vf = propagation_vision_feats[-1]
+                _B = _vf.size(1)
+                _H, _W = propagation_feat_sizes[-1]
+                # (HW)BC -> BCHW, identical to the derivation in _encode_new_memory.
+                _pix = _vf.permute(1, 2, 0).view(_B, self.hidden_dim, _H, _W)
+                _pf_cb(int(frame_idx), high_res_masks, _pix, object_score_logits)
+            except Exception as _exc:                                    # noqa: BLE001
+                # Never let extraction break tracking: a failed capture costs one training sample,
+                # a raised exception costs the whole run. Warn once, then disable.
+                if not getattr(self, "_tiab_perframe_warned", False):
+                    print(f"    [tiab_perframe] callback raised, disabling: {_exc!r}")
+                    self._tiab_perframe_warned = True
+                    self._tiab_perframe_callback = None
         if self.use_obj_ptrs_in_encoder:
             # similar to spatial memory, the object pointers are stored with multiplex
             current_out["obj_ptr"] = multiplex_state.mux(obj_ptr)

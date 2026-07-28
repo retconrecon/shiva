@@ -39,6 +39,9 @@ class TIABExtractionSession:
         self.session_id = session_id
         self.extractor = extractor
         self._buffer = {}
+        # Keyed by frame so the consumer can take the sample for the frame it is handling, rather
+        # than whatever happened to be captured last.
+        self._pf_buffer = {}
 
         # Find the object where _encode_new_memory runs during propagation.
         # Sam3MultiplexPredictorWrapper inherits _encode_new_memory from
@@ -65,8 +68,21 @@ class TIABExtractionSession:
                 "object_scores": object_scores,
             }
 
+        # PER-FRAME capture (blocker 5). The `_capture` callback above rides on
+        # `_encode_new_memory`, which fires on only ~6.27% of frames during propagation (measured on
+        # mouse045: 170/2713) because propagation runs with run_mem_encoder=False. `_track_step_aux`
+        # runs EVERY frame, so this second callback is the one that actually yields a training set.
+        # It carries frame_idx, so a sample can never be attributed to the wrong frame.
+        def _capture_perframe(frame_idx, pred_masks, pix_feat, object_scores):
+            self._pf_buffer[int(frame_idx)] = {
+                "pred_masks": pred_masks,
+                "pix_feat": pix_feat,
+                "object_scores": object_scores,
+            }
+
         for target in self._targets:
             target._tiab_extract_callback = _capture
+            target._tiab_perframe_callback = _capture_perframe
 
     def __enter__(self):
         return self
@@ -76,6 +92,8 @@ class TIABExtractionSession:
         for target in self._targets:
             if hasattr(target, '_tiab_extract_callback'):
                 del target._tiab_extract_callback
+            if hasattr(target, '_tiab_perframe_callback'):
+                del target._tiab_perframe_callback
         self.extractor.finalize()
 
     def on_frame(self, frame_idx, output_masks, obj_ids):
@@ -84,6 +102,21 @@ class TIABExtractionSession:
         Pairs the buffered internal tensors (from _encode_new_memory)
         with the external output masks and saves via the extractor.
         """
+        # PREFER the per-frame capture for THIS frame; fall back to the memory-encoder buffer.
+        # The fallback is kept so this class still works against a build without the per-frame hook.
+        _pf = self._pf_buffer.pop(int(frame_idx), None)
+        if _pf is not None:
+            self.extractor.on_frame(
+                frame_idx=frame_idx,
+                pred_masks_pre_constraint=_pf["pred_masks"],
+                pix_feat=_pf["pix_feat"],
+                object_score_logits=_pf["object_scores"],
+                output_masks=output_masks,
+                obj_ids=list(int(x) for x in obj_ids),
+            )
+            self._buffer = {}
+            return
+
         if not self._buffer:
             return
 
