@@ -36,9 +36,25 @@ class BoundaryAttention(nn.Module):
             hidden_dim, num_heads, batch_first=True,
         )
         self.norm = nn.LayerNorm(hidden_dim)
-        # Output: per-pixel logit adjustment
+        # ☢ GEOMETRY CHANNELS. Without these the head CANNOT REPRESENT THE TASK.
+        #
+        # `pixel_features` arrives as [1, C, H, W] and is expanded across objects, so
+        # `contested_feats` is byte-identical for every object; the only per-object variation
+        # reaching a pixel is the single 64-d attention `context` vector. The head therefore
+        # computes refine_head(shared_field(p) + context_b) - one broadcast vector per object
+        # modulating a field that is the same for everyone. To decide "does this contested pixel
+        # belong to object 1 or object 2?" it needs the pixel's position RELATIVE TO EACH OBJECT,
+        # and it currently has no coordinate, no distance, and no motion input at all.
+        #
+        # Five cheap channels supply exactly that, per object per pixel:
+        #   (x, y)      normalised cell coordinates
+        #   (dx, dy)    offset from the cell to THAT object's centroid
+        #   d           its magnitude
+        # This is the nearly-free prior the GRU was otherwise expected to launder through a 64-d
+        # bottleneck. Cost: 5 * hidden_dim extra weights (~320), i.e. capacity is not the point.
+        self.n_geom = 5
         self.refine_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim + self.n_geom, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -47,7 +63,7 @@ class BoundaryAttention(nn.Module):
     # 300K contested pixels would create a 5.76TB attention matrix.
     MAX_CONTESTED = 4096
 
-    def forward(self, pixel_features, identity_embs, contested_mask):
+    def forward(self, pixel_features, identity_embs, contested_mask, obj_centroids=None):
         """
         Args:
             pixel_features: [B, C, H, W] backbone features (stride 16)
@@ -98,6 +114,20 @@ class BoundaryAttention(nn.Module):
             contested_feats = pf[:, :, contested_mask].permute(0, 2, 1)
         combined = contested_feats + context.expand_as(contested_feats)
         combined = self.norm(combined)
+
+        # Per-object geometry for each contested cell (see n_geom above). Built here rather than
+        # upstream so it always matches the exact cells `contested_mask` selected.
+        idx = contested_mask.nonzero(as_tuple=False)                  # [n, 2] as (y, x)
+        ny = idx[:, 0].float() / max(H - 1, 1)
+        nx = idx[:, 1].float() / max(W - 1, 1)
+        base = torch.stack([nx, ny], dim=-1).unsqueeze(0).expand(B, -1, -1)   # [B, n, 2]
+        if obj_centroids is None:
+            # Fall back to frame centre for every object: geometry degrades to absolute position
+            # rather than silently mis-informing the head with a wrong per-object reference.
+            obj_centroids = torch.full((B, 2), 0.5, device=pixel_features.device)
+        off = base - obj_centroids.to(base.device).unsqueeze(1)       # [B, n, 2]
+        dist = off.norm(dim=-1, keepdim=True)                         # [B, n, 1]
+        combined = torch.cat([combined, base, off, dist], dim=-1)
 
         # Produce per-pixel adjustment
         adjustments = self.refine_head(combined).squeeze(-1)  # [B, n_contested]
@@ -253,9 +283,12 @@ class TemporalIdentityBoundaryModule(nn.Module):
         appearance_embs,
         centroid_history,
         object_score_logits,
+        return_pre_argmax: bool = False,
     ):
         """
         Args:
+            return_pre_argmax: return refined logits BEFORE the non-overlap argmax. Training must
+                set this - see the note at the return site. Inference leaves it False.
             pred_masks: [B, H, W] raw mask logits from SAM3.1 decoder
             pix_feat: [B, C, Hf, Wf] backbone features (stride 16)
             appearance_embs: [B, D_appear] per-object appearance embeddings
@@ -286,7 +319,10 @@ class TemporalIdentityBoundaryModule(nn.Module):
 
         # If no contested pixels, fall back to standard argmax
         if n_contested == 0:
-            return self._hard_argmax(pred_masks)
+            # Same reasoning as the main return: training needs pre-argmax logits. A frame with no
+            # contested pixels still contributes to the loss (the keypoint terms are always active),
+            # and argmax-ing it here would zero the gradient on every losing pixel of that frame.
+            return pred_masks if return_pre_argmax else self._hard_argmax(pred_masks)
 
         # Step 2: Encode identity
         identity_embs = self.identity_encoder(
@@ -302,14 +338,34 @@ class TemporalIdentityBoundaryModule(nn.Module):
         # there (~3MB instead of ~512MB), then bilinear-upsample the
         # refinement back to mask resolution.
         Hf, Wf = pix_feat.shape[-2:]
-        contested_feat_res = F.interpolate(
-            contested.unsqueeze(0).unsqueeze(0).float(),
-            size=(Hf, Wf), mode="nearest",
+        # ☢ MAX-POOL, NOT NEAREST. `mode="nearest"` keeps exactly ONE source pixel per (H/Hf x W/Wf)
+        # block - at 1152 -> 72 that is 1 of every 16x16 = 256 pixels. A boundary band is only ~2 px
+        # wide, so nearest retains it with probability ~2/16 per crossed cell and DROPS ~85% of the
+        # cells the band actually touches: the module was mostly not seeing the boundary it exists to
+        # refine. Max-pooling marks a cell contested if ANY pixel in it is, which is the correct
+        # semantics for "does this cell contain contested boundary?".
+        contested_feat_res = F.adaptive_max_pool2d(
+            contested.unsqueeze(0).unsqueeze(0).float(), (Hf, Wf),
         ).squeeze(0).squeeze(0).bool()
+
+        # Per-object centroid in NORMALISED feature-grid coordinates, for the geometry channels.
+        # Soft (probability-weighted) so it is differentiable and stays defined when a mask is
+        # nearly empty; falls back to the frame centre for an object with no mass at all.
+        with torch.no_grad():
+            _p = torch.sigmoid(pred_masks)                                  # [B, H, W]
+            _hh, _ww = _p.shape[-2], _p.shape[-1]
+            _ys = torch.linspace(0, 1, _hh, device=_p.device).view(1, _hh, 1)
+            _xs = torch.linspace(0, 1, _ww, device=_p.device).view(1, 1, _ww)
+            _m = _p.flatten(1).sum(dim=1).clamp(min=1e-6)                   # [B]
+            _cy = (_p * _ys).flatten(1).sum(dim=1) / _m
+            _cx = (_p * _xs).flatten(1).sum(dim=1) / _m
+            _empty = (_p.flatten(1).sum(dim=1) < 1e-5)
+            obj_centroids = torch.stack([_cx, _cy], dim=-1)                 # [B, 2]
+            obj_centroids[_empty] = 0.5
 
         # Step 4: Boundary attention at feature resolution
         refinement_feat = self.boundary_attention(
-            pix_feat, identity_embs, contested_feat_res,
+            pix_feat, identity_embs, contested_feat_res, obj_centroids=obj_centroids,
         )  # [B, Hf, Wf]
 
         # Step 5: Upsample refinement to mask resolution (no learnable params)
@@ -331,6 +387,20 @@ class TemporalIdentityBoundaryModule(nn.Module):
 
         # Step 7: Add refinement to original logits, then argmax
         refined_masks = pred_masks + gated_refinement
+
+        # ☢ TRAINING MUST SEE THE PRE-ARGMAX LOGITS.
+        # `_hard_argmax` routes every LOSING pixel through `torch.clamp(x, max=-10.0)`, whose
+        # gradient is exactly 0 for x > -10 - and every contested pixel is within `contest_margin`
+        # of the top score by construction, so it is always in that range. Training on the
+        # post-argmax tensor therefore gives zero gradient to the losing object at exactly the
+        # pixels TIAB exists to reassign: the module can reweight mass it already owns but can never
+        # learn to CLAIM a pixel. That single fact is sufficient to explain why TIAB has never
+        # produced a measurable improvement.
+        #
+        # Inference keeps the hard argmax (a tracker needs non-overlapping masks); only the training
+        # path takes the soft branch. Default False so the inference contract is unchanged.
+        if return_pre_argmax:
+            return refined_masks
         return self._hard_argmax(refined_masks)
 
     @staticmethod
