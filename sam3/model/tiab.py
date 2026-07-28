@@ -151,8 +151,13 @@ class TemporalIdentityEncoder(nn.Module):
     def __init__(self, appearance_dim=512, trajectory_len=16, hidden_dim=128):
         super().__init__()
         self.trajectory_len = trajectory_len
-        # Trajectory encoder
-        self.traj_gru = nn.GRU(2, 64, batch_first=True)
+        # ☢ VELOCITY, NOT JUST POSITION. The GRU took (x, y) only - but during a crossing the two
+        # animals occupy nearly the SAME coordinates, so their position histories converge and the
+        # identity embeddings converge with them, precisely at the moment identity is needed. Heading
+        # and speed are what still separate them there. Feeding first differences (dx, dy) alongside
+        # position hands the encoder that signal directly instead of asking it to recover derivatives
+        # from a raw sequence through a 64-unit bottleneck. Input 2 -> 4.
+        self.traj_gru = nn.GRU(4, 64, batch_first=True)
         self.traj_proj = nn.Linear(64, hidden_dim)
         # Appearance projection
         self.appear_proj = nn.Linear(appearance_dim, hidden_dim)
@@ -175,8 +180,12 @@ class TemporalIdentityEncoder(nn.Module):
         Returns:
             identity_emb: [B, hidden_dim]
         """
-        # Trajectory
-        traj_out, _ = self.traj_gru(centroid_history)
+        # Trajectory: [x, y, dx, dy]. First differences, zero-padded at t=0 so the sequence length
+        # is unchanged and a fresh object (whose history is a repeated constant, per the padding rule
+        # in shiva_tracker) yields zero velocity rather than a discontinuity.
+        _vel = torch.zeros_like(centroid_history)
+        _vel[:, 1:] = centroid_history[:, 1:] - centroid_history[:, :-1]
+        traj_out, _ = self.traj_gru(torch.cat([centroid_history, _vel], dim=-1))
         traj_feat = self.traj_proj(traj_out[:, -1])  # last hidden state
 
         # Appearance — zeroed during Phase 1 training so fuse layer
@@ -259,9 +268,13 @@ class TemporalIdentityBoundaryModule(nn.Module):
         hidden_dim=64,
         num_heads=4,
         contest_margin=2.0,
+        contest_fg_threshold=0.0,
     ):
         super().__init__()
         self.contest_margin = contest_margin
+        # Logit threshold for 'some object claims this pixel'. 0.0 = the sigmoid midpoint,
+        # i.e. the same foreground criterion the tracker itself uses when binarising.
+        self.contest_fg_threshold = contest_fg_threshold
 
         self.identity_encoder = TemporalIdentityEncoder(
             appearance_dim=appearance_dim,
@@ -310,10 +323,26 @@ class TemporalIdentityBoundaryModule(nn.Module):
         if B == 2:
             score_diff = (pred_masks[0] - pred_masks[1]).abs()
             contested = score_diff < self.contest_margin
+            _top1 = torch.maximum(pred_masks[0], pred_masks[1])
         else:
             sorted_scores, _ = pred_masks.sort(dim=0, descending=True)
             score_diff = sorted_scores[0] - sorted_scores[1]
             contested = score_diff < self.contest_margin
+            _top1 = sorted_scores[0]
+
+        # ☢ FOREGROUND GATE. Without it the contested set is dominated by BACKGROUND, which is the
+        # opposite of what this module is for.
+        #
+        # `top1 - top2 < margin` is true wherever the objects AGREE - and they agree most strongly on
+        # background, where every logit is confidently negative (e.g. -18 vs -19 differ by 1.0 < 2.0).
+        # Since background is the large majority of a top-down arena frame, the module was spending
+        # its capacity, its attention budget and its MAX_CONTESTED cap on empty bedding rather than on
+        # the animal-animal boundary named in the class docstring.
+        #
+        # Requiring the winning logit to be foreground (> tau) restricts the set to pixels some object
+        # actually claims, which is where a boundary can exist at all. This also makes the
+        # MAX_CONTESTED=4096 subsample (and its non-deterministic randperm) far less likely to fire.
+        contested = contested & (_top1 > self.contest_fg_threshold)
 
         n_contested = contested.sum().item()
 
