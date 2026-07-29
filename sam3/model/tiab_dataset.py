@@ -52,15 +52,26 @@ class TIABExtractor:
         crossing_distance_thresh=50.0,
         non_crossing_sample_rate=0.1,
         image_size=1008,
+        contest_margin=2.0,
+        min_contested_px=8,
     ):
         """
         Args:
             save_dir: directory to save extracted frames
             gt_data: dict {frame_idx: {animal_id: (cx, cy)}} — GT centroids
             n_animals: number of animals
-            crossing_iou_thresh: IoU threshold for crossing detection
-            non_crossing_sample_rate: fraction of non-crossing frames to save
+            crossing_distance_thresh: RETAINED FOR API COMPATIBILITY, no longer used for
+                selection. Frame selection is now on the contested-pixel count (see on_frame).
+            non_crossing_sample_rate: fraction of uncontested frames to save anyway, so the model
+                still sees easy negatives and does not train only on the hard tail.
             image_size: video resolution for centroid normalization
+            contest_margin: a foreground pixel is CONTESTED when its top-2 logit gap is below this.
+                Must match the margin the training loss uses, or selection and loss disagree about
+                what the module is being trained on.
+            min_contested_px: a frame is worth keeping when it has at least this many contested
+                pixels. 8 is deliberately low: the measured median under the old rule was 2, and the
+                point is to stop saving frames with nothing to learn from, not to chase only the
+                hardest frames.
         """
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +79,9 @@ class TIABExtractor:
         self.n_animals = n_animals
         self.crossing_distance_thresh = crossing_distance_thresh
         self.non_crossing_sample_rate = non_crossing_sample_rate
+        self.contest_margin = contest_margin
+        self.min_contested_px = min_contested_px
+        self._contested_hist = []
         self.image_size = image_size
         self._frame_count = 0
         self._saved_count = 0
@@ -95,32 +109,66 @@ class TIABExtractor:
         """
         self._frame_count += 1
 
-        # Determine if crossing via centroid distance (not mask IoU — output
-        # masks are non-overlapping by construction after SAM3.1's argmax,
-        # so IoU is always 0).
-        is_crossing = False
+        # ☢ SELECT ON CONTESTED PIXELS DIRECTLY, NOT ON A CENTROID-DISTANCE PROXY.
+        #
+        # MEASURED FAILURE OF THE OLD RULE (2026-07-28, on this extractor's own output for
+        # CalMS21 mouse025, 401 saved shards):
+        #   * `is_crossing` fired on 1 of 401 shards (0.2%)
+        #   * 42.4% of saved frames contained ZERO contested pixels
+        #   * median contested pixels per frame: 2; contested share of foreground: 0.057%
+        # TIAB is a contested-pixel refiner, so that training set has essentially no signal. The
+        # consequence was mathematical: the identity loss stayed at 8.686e-05 for all 10 epochs,
+        # unchanged to four significant figures, while 26 of 28 parameter tensors drifted on the
+        # gate regulariser alone. A checkpoint trained that way is the random-weight case.
+        #
+        # THE CAUSE was `crossing_distance_thresh=50.0`, a pixel constant roughly 4x stricter than
+        # the contact definition used everywhere else in this project (one body length, ~177 px for
+        # this animal). It also compared MASK-space centroids against a threshold reasoned about in
+        # FRAME space, and for CalMS21 the mask is a stretched square (1008x1008 from 1024x570), so
+        # the implied threshold was anisotropic and differed by ~1.8x between the axes.
+        #
+        # THE FIX is to stop proxying. `pred_masks_pre_constraint` is the pre-argmax logit stack, so
+        # the contested set can be computed exactly, here, from the same quantity the training loss
+        # consumes: a foreground pixel whose top-2 logit gap is below the margin. Selecting on it
+        # directly is scale-free (no pixel constant, no species assumption, no coordinate space to
+        # get wrong) and it is the definition rather than a correlate of it.
+        #
+        # The foreground gate matters and is not optional: in a top-down arena the objects agree most
+        # strongly on empty bedding, so without `top1 > 0` the "contested" set is dominated by
+        # background. Measured on this same data, 98.4% of an ungated contested set was background.
+        n_contested = 0
+        try:
+            lg = pred_masks_pre_constraint.squeeze(1).float()      # [B, H, W] pre-argmax logits
+            if lg.shape[0] >= 2:
+                top2 = torch.topk(lg, 2, dim=0).values
+                fg = top2[0] > 0.0
+                n_contested = int((fg & ((top2[0] - top2[1]) < self.contest_margin)).sum().item())
+        except Exception:                                          # noqa: BLE001
+            n_contested = 0        # never let the selector crash an extraction run
+
+        is_crossing = n_contested >= self.min_contested_px
+
+        # Keep the centroid-distance signal as RECORDED METADATA only. It is still informative for
+        # analysis (and for cross-checking against `encounter_coverage.json`), but it no longer
+        # decides what gets saved.
+        min_pair_dist = float("inf")
         oids = sorted(output_masks.keys())
         if len(oids) >= 2:
-            centroids = {}
+            clist = []
             for oid in oids:
                 ys, xs = np.where(output_masks[oid])
                 if len(xs) > 0:
-                    centroids[oid] = (float(xs.mean()), float(ys.mean()))
-            clist = list(centroids.values())
+                    clist.append((float(xs.mean()), float(ys.mean())))
             for i in range(len(clist)):
                 for j in range(i + 1, len(clist)):
                     dx = clist[i][0] - clist[j][0]
                     dy = clist[i][1] - clist[j][1]
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist < self.crossing_distance_thresh:
-                        is_crossing = True
-                        break
-                if is_crossing:
-                    break
+                    min_pair_dist = min(min_pair_dist, (dx * dx + dy * dy) ** 0.5)
 
         # Decide whether to save this frame
         save = is_crossing or self._rng.random() < self.non_crossing_sample_rate
 
+        self._contested_hist.append(n_contested)
         if not save:
             return
 
@@ -143,6 +191,11 @@ class TIABExtractor:
             "is_crossing": is_crossing,
             "obj_ids": list(int(x) for x in obj_ids),
             "frame_idx": frame_idx,
+            # Recorded so a later audit can census the training set WITHOUT recomputing logits.
+            # The absence of exactly this field is why the empty-contested-set defect went unnoticed
+            # through a full training run and into a checkpoint.
+            "n_contested": n_contested,
+            "min_pair_dist": min_pair_dist,
         }
         torch.save(frame_data, self.save_dir / f"frame_{frame_idx:06d}.pt")
         self._saved_count += 1
@@ -151,17 +204,38 @@ class TIABExtractor:
 
     def finalize(self):
         """Save metadata after extraction completes."""
+        hist = np.asarray(self._contested_hist) if self._contested_hist else np.zeros(1)
+        saved_zero = int((hist == 0).sum())
         meta = {
             "total_frames": self._frame_count,
             "saved_frames": self._saved_count,
             "crossing_frames": self._crossing_frames,
             "n_animals": self.n_animals,
             "image_size": self.image_size,
+            # THE EXTRACT-QUALITY CENSUS. A TIAB training set is only as good as its contested-pixel
+            # content, so that content is now a first-class recorded property of the extract rather
+            # than something a human has to think to go and measure.
+            "contest_margin": self.contest_margin,
+            "min_contested_px": self.min_contested_px,
+            "contested_mean": float(hist.mean()),
+            "contested_median": float(np.median(hist)),
+            "contested_max": int(hist.max()),
+            "frames_with_zero_contested_pct": float(100.0 * saved_zero / max(len(hist), 1)),
         }
         with open(self.save_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
         print(f"TIAB extraction: {self._saved_count}/{self._frame_count} frames saved "
-              f"({len(self._crossing_frames)} crossings)")
+              f"({len(self._crossing_frames)} contested)")
+        print(f"TIAB extraction: contested px per frame mean {meta['contested_mean']:.1f} "
+              f"median {meta['contested_median']:.0f} max {meta['contested_max']} | "
+              f"{meta['frames_with_zero_contested_pct']:.1f}% of frames had ZERO")
+        # ☢ LOUD REFUSAL, not a silent pass. Training on this is what produced a checkpoint whose
+        # loss never moved across 10 epochs, and nothing in the pipeline objected at the time.
+        if meta["contested_median"] < 1 or meta["contested_mean"] < 5:
+            print("TIAB extraction: ☢ WARNING - this extract has almost no contested pixels. "
+                  "TIAB is a contested-pixel refiner, so training on it will produce a checkpoint "
+                  "that cannot learn (expect a flat loss). Do NOT use it for an ablation. "
+                  "Check the detector/margin before spending GPU on training.")
 
 
 class TIABDataset(Dataset):
