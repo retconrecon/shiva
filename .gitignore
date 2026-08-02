@@ -151,3 +151,6 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+# Durable per-worktree scratch (see global CLAUDE.md scratch convention)
+.scratch/

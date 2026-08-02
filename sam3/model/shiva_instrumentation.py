@@ -86,6 +86,13 @@ KNOWN_HOOKS: Dict[str, str] = {
     "pixel_paint_injected": "recovered mask written into SAM3's memory",
     "pixel_paint_inject_failed": "memory injection RAISED — recovery is a no-op",
     "pixel_paint_inject_unavailable": "no add_new_masks on the inner model",
+    # --- closed-world constraint check (read-only measurement) ---
+    "closed_world_ok": "frame satisfied the exactly-N permutation constraint",
+    "closed_world_violation": "frame VIOLATED the closed-world constraint",
+    "closed_world_overlap": "two identities sitting on the same animal",
+    "closed_world_absorption": "one identity large enough to carry two bodies",
+    "closed_world_collapse": "a mask cratered below its running median",
+    "closed_world_missing": "fewer than N identities present",
 }
 
 _lock = threading.Lock()
