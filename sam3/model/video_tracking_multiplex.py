@@ -2459,9 +2459,12 @@ class VideoTrackingMultiplex(nn.Module):
             current_out["object_score_logits"] = object_score_logits
             iou_score = current_out["multistep_pred_ious"][-1].max(-1)[0]
             current_out["iou_score"] = iou_score
+            # Store as a Python float rather than a device tensor: memory
+            # pruning ranks frames by this score, and a tensor would force a
+            # CUDA sync on every .item() during that ranking.
             current_out["eff_iou_score"] = self.cal_mem_score(
                 object_score_logits, iou_score
-            )
+            ).item()
         # we need to return this for encoding new masks in the dynamic mode
         current_out["object_score_logits"] = object_score_logits
 

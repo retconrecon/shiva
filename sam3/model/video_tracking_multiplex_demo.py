@@ -63,6 +63,7 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
+        lazy_loading_frames=False,
     ):
         """Initialize a inference state."""
         # Make sure that sigmoid is used on mask logits (should be True for all our recent models).
@@ -80,6 +81,7 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
+            lazy_loading_frames=lazy_loading_frames,
         )
         inference_state = {}
         inference_state["images"] = images

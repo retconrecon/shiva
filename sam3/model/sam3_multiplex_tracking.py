@@ -208,10 +208,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         # Initialize inference state (inlined from Sam3DemoMixin.init_state)
         if use_torchcodec:
@@ -228,8 +230,11 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            lazy_loading_frames=lazy_loading_frames,
         )
         inference_state = {}
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+        self._shiva_offload_state_to_cpu = offload_state_to_cpu
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
         inference_state["device"] = torch.device("cuda")
@@ -355,7 +360,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 is_instance_processing=is_instance_processing,
             )
 
-            if self.hotstart_delay > 0:
+            if 0 < self.hotstart_delay < float('inf'):
                 # accumulate the outputs for the first `hotstart_delay` frames
                 hotstart_buffer.append([frame_idx, out])
                 # update the object IDs removed by hotstart so that we don't output them
@@ -1236,7 +1241,13 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 if obj_id in filtered_obj_id_to_mask:
                     del filtered_obj_id_to_mask[obj_id]
 
-        inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
+        # Move mask tensors to CPU to prevent GPU accumulation at high object counts.
+        # N=4 at 500 frames = ~1.1GB GPU; N=50 at 500 frames = ~49.5GB GPU (OOM).
+        # On CPU the same data is ~49.5GB system RAM — acceptable on 196GB machines.
+        cpu_masks = {}
+        for oid, mask in filtered_obj_id_to_mask.items():
+            cpu_masks[oid] = mask.cpu() if hasattr(mask, 'cpu') else mask
+        inference_state["cached_frame_outputs"][frame_idx] = cpu_masks
 
     def _build_sam2_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
@@ -1796,7 +1807,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
 
                 current_frame_res = tracking_res[frame_idx]
                 for obj_id, mask in zip(out_obj_ids, out_binary_masks):
-                    mask_tensor = torch.tensor(mask[None], dtype=torch.bool)
+                    # Store as CPU bool tensor to avoid GPU accumulation.
+                    # For very long eval videos, callers should use packbits.
+                    mask_tensor = torch.tensor(mask[None], dtype=torch.bool, device="cpu")
                     current_frame_res[obj_id + start_obj_id] = mask_tensor
                 obj_ids_this_prompt.update(current_frame_res.keys())
 
@@ -1837,18 +1850,22 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            lazy_loading_frames=lazy_loading_frames,
         )
         # Initialize generator state for batched processing
         inference_state["generator_state"] = {
@@ -1944,7 +1961,7 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
                 is_instance_processing=is_instance_processing,
             )
 
-            if self.hotstart_delay > 0:
+            if 0 < self.hotstart_delay < float('inf'):
                 # accumulate the outputs for the first `hotstart_delay` frames
                 hotstart_buffer.append([frame_idx, out])
                 # update the object IDs removed by hotstart so that we don't output them
@@ -2219,18 +2236,22 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        lazy_loading_frames=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            lazy_loading_frames=lazy_loading_frames,
         )
         # initialize extra states
         inference_state["action_history"] = []  # for logging user actions
@@ -2256,6 +2277,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
     def cancel_propagation(self, inference_state):
@@ -3352,6 +3374,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
         # Step 4: Set up the singleton state structure for the extracted object

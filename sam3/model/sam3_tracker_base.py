@@ -60,7 +60,9 @@ class Sam3TrackerBase(torch.nn.Module):
         # (this helps save GPU or CPU memory on very long videos for semi-supervised VOS eval, where only the first frame receives prompts)
         trim_past_non_cond_mem_for_eval=False,
         # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
-        non_overlap_masks_for_mem_enc=False,
+        # SHIVA default=True. VideoTrackingMultiplex has default=False.
+        # Effective value comes from model_builder.py constructor args.
+        non_overlap_masks_for_mem_enc=True,
         # the maximum number of object pointers from other frames in encoder cross attention
         max_obj_ptrs_in_encoder=16,
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
@@ -68,9 +70,11 @@ class Sam3TrackerBase(torch.nn.Module):
         # whether to compile all the model compoents
         compile_all_components=False,
         # select the frame with object existence
-        use_memory_selection=False,
+        # SHIVA default=True. VideoTrackingMultiplex has default=False.
+        use_memory_selection=True,
         # when using memory selection, the threshold to determine if the frame is good
-        mf_threshold=0.01,
+        # SHIVA default=0.05. VideoTrackingMultiplex has default=0.01.
+        mf_threshold=0.05,
     ):
         super().__init__()
 
@@ -515,6 +519,20 @@ class Sam3TrackerBase(torch.nn.Module):
         return score_per_frame
 
     def frame_filter(self, output_dict, track_in_reverse, frame_idx, num_frames, r):
+        """Select memory frames by quality score for attention.
+
+        NOTE: This method is duplicated in VideoTrackingMultiplex
+        (video_tracking_multiplex.py ~line 2682). Changes here should be
+        mirrored there until they are extracted into a shared utility.
+
+        The defaults for use_memory_selection and mf_threshold differ between
+        this class (True/0.05) and VideoTrackingMultiplex (False/0.01). The
+        effective values come from model_builder.py constructor args.
+
+        Iterates over actual existing dict keys instead of a linear
+        range scan. After memory pruning, the dict is sparse — a linear scan
+        wastes iterations on empty indices and may miss preserved landmarks.
+        """
         if (frame_idx == 0 and not track_in_reverse) or (
             frame_idx == num_frames - 1 and track_in_reverse
         ):
@@ -525,33 +543,36 @@ class Sam3TrackerBase(torch.nn.Module):
         )  ## maximum number of pointer memory frames to consider
 
         if not track_in_reverse:
-            start = frame_idx - 1
-            end = 0
-            step = -r
             must_include = frame_idx - 1
         else:
-            start = frame_idx + 1
-            end = num_frames
-            step = r
             must_include = frame_idx + 1
 
+        non_cond = output_dict["non_cond_frame_outputs"]
+
+        # Iterate over actual keys (sparse-safe) instead of range(start, end, step)
+        existing_frames = sorted(non_cond.keys(), reverse=not track_in_reverse)
+
         valid_indices = []
-        for i in range(start, end, step):
-            if (
-                i not in output_dict["non_cond_frame_outputs"]
-                or "eff_iou_score" not in output_dict["non_cond_frame_outputs"][i]
-            ):
+        for i in existing_frames:
+            # Only look at frames before (or after, if reverse) current frame
+            if not track_in_reverse and i >= frame_idx:
+                continue
+            if track_in_reverse and i <= frame_idx:
                 continue
 
-            score_per_frame = output_dict["non_cond_frame_outputs"][i]["eff_iou_score"]
+            entry = non_cond[i]
+            if "eff_iou_score" not in entry:
+                continue
 
-            if score_per_frame > self.mf_threshold:  # threshold
+            score_per_frame = entry["eff_iou_score"]
+
+            if score_per_frame > self.mf_threshold:
                 valid_indices.insert(0, i)
 
             if len(valid_indices) >= max_num - 1:
                 break
 
-        if must_include not in valid_indices:
+        if must_include not in valid_indices and must_include in non_cond:
             valid_indices.append(must_include)
 
         return valid_indices
@@ -1067,11 +1088,18 @@ class Sam3TrackerBase(torch.nn.Module):
         def _trim_past_out(past_out, current_out):
             if past_out is None:
                 return None
-            return {
+            trimmed = {
                 "pred_masks": past_out["pred_masks"],
                 "obj_ptr": past_out["obj_ptr"],
                 "object_score_logits": past_out["object_score_logits"],
             }
+            # Preserve scores so memory pruning can rank trimmed frames
+            # (without these, pruner defaults to 0.0 and evicts good frames)
+            if "eff_iou_score" in past_out:
+                trimmed["eff_iou_score"] = past_out["eff_iou_score"]
+            if "best_iou_score" in past_out:
+                trimmed["best_iou_score"] = past_out["best_iou_score"]
+            return trimmed
 
         if self.trim_past_non_cond_mem_for_eval and not self.training:
             r = self.memory_temporal_stride_for_eval
@@ -1079,7 +1107,6 @@ class Sam3TrackerBase(torch.nn.Module):
             past_out = output_dict["non_cond_frame_outputs"].get(past_frame_idx, None)
 
             if past_out is not None:
-                print(past_out.get("eff_iou_score", 0))
                 if (
                     self.use_memory_selection
                     and past_out.get("eff_iou_score", 0) < self.mf_threshold
