@@ -9,6 +9,7 @@ from sam3.model.data_misc import NestedTensor
 from sam3.model.io_utils import load_video_frames
 from sam3.model.multiplex_utils import MultiplexState
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
 from sam3.model.video_tracking_multiplex import (
     concat_points,
     NO_OBJ_SCORE,
@@ -3318,11 +3319,22 @@ class Sam3VideoTrackingMultiplexDemo(VideoTrackingMultiplexDemo):
         )
         return pred_masks_after
 
-    @staticmethod
-    def _suppress_object_pw_area_shrinkage(pred_masks):
+    def _suppress_object_pw_area_shrinkage(self, pred_masks):
         """
         This function suppresses masks that shrink in area after applying pixelwise non-overlapping constriants.
         Note that the final output can still be overlapping.
+
+        SHIVA (2026-08): was a @staticmethod; it needs `self` to reach the motion
+        prior. Every call site already invokes it through an instance
+        (sam3_multiplex_base.py:2569, sam3_video_base.py:1680, and the
+        compile_wrapper rebind at sam3_multiplex_tracking.py:1365), so binding
+        it changes no call.
+
+        This is THE identity-critical decision on the live path. Its output is
+        the memory-encoder input; the emitted mask never passes through here
+        (build_outputs interpolates raw per-object logits and never resolves
+        overlap), so what this function decides is what the next frame's
+        memory-conditioned decoder believes.
         """
         # Apply pixel-wise non-overlapping constraint based on mask scores
         # pixel_level_non_overlapping_masks = super()._apply_non_overlapping_constraints(
@@ -3335,7 +3347,48 @@ class Sam3VideoTrackingMultiplexDemo(VideoTrackingMultiplexDemo):
 
         device = pred_masks.device
         # "max_obj_inds": object index of the object with the highest score at each location
-        max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
+        #
+        # SHIVA (2026-08): when a motion prior is published, resolve contested
+        # pixels by MAP (appearance logit + gated position/persistence prior)
+        # instead of by bare appearance argmax. The gate is ~0 wherever one
+        # logit dominates, so frames without genuine ties are unchanged.
+        # Absent the prior this is byte-identical to upstream.
+        _prior = getattr(self, "_shiva_map_prior", None)
+        max_obj_inds = None
+        if _prior is not None and _prior.get("batch_size") == batch_size:
+            try:
+                from sam3.model.shiva_map_partition import map_partition_labels
+                max_obj_inds = map_partition_labels(
+                    pred_masks,
+                    centroids=_prior.get("centroids"),
+                    sigmas=_prior.get("sigmas"),
+                    valid=_prior.get("valid"),
+                    # Written by this same function on the previous frame, so it
+                    # is always at the resolution the partition actually runs at.
+                    prev_labels=getattr(self, "_shiva_prev_labels", None),
+                    velocities=_prior.get("velocities"),
+                    cfg=_prior["cfg"],
+                ).unsqueeze(1)
+            except Exception as e:  # never let the prior break tracking
+                if not getattr(self, "_shiva_map_prior_warned", False):
+                    self._shiva_map_prior_warned = True
+                    logging.warning(
+                        "SHIVA MAP partition failed, falling back to argmax: %s",
+                        e, exc_info=True,
+                    )
+                max_obj_inds = None
+        elif _prior is not None and not torch.compiler.is_compiling():
+            # Object count changed between publish and use. Falling back
+            # silently is how features rot, so make it visible.
+            _shiva_bump("map_partition_skipped_batch_mismatch")
+
+        if max_obj_inds is None:
+            max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
+
+        # Publish the winning labels for the next frame's persistence prior.
+        if not torch.compiler.is_compiling():
+            self._shiva_prev_labels = max_obj_inds[:, 0].squeeze(0).detach()
+
         # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
         batch_obj_inds = torch.arange(batch_size, device=device)[:, None, None, None]
         keep = max_obj_inds == batch_obj_inds
@@ -3358,8 +3411,33 @@ class Sam3VideoTrackingMultiplexDemo(VideoTrackingMultiplexDemo):
         area_ratio = area_after / area_before
         keep = area_ratio >= shrink_threshold
         keep_mask = keep[..., None, None].expand_as(pred_masks)
+        # KEEP-CONTESTED (Axovera, wave4). Upstream's else-branch was
+        # `torch.clamp(pred_masks, max=-10.0)`, which DELETES an object outright once it retains
+        # less than 30% of its area after the partition. Because this runs on the memory-encoder
+        # input, the deleted frame is then written into memory as "object absent"
+        # (sam3_multiplex_base.py derives object_score_logits from mere non-emptiness), so a single
+        # heavy occlusion can remove an animal and take its memory with it. That is the
+        # "masks disappear" failure observed on real four-fish footage.
+        #
+        # The partition this function already computed is a strictly better answer than deletion:
+        # give the object the pixels it actually WON. An object that won nothing still ends up
+        # empty, because pixel_level_non_overlapping_masks is fully clamped in that case, so this
+        # cannot resurrect an object the evidence does not support.
+        #
+        # Behaviour is UNCHANGED on any frame where every object clears the threshold.
+        # To revert: restore `torch.clamp(pred_masks, max=-10.0)` below.
+        # 2026-08: this function is wrapped by compile_wrapper(fullgraph=True) at
+        # sam3_multiplex_tracking.py:1365. A print() and an int(...sum()) are a
+        # graph break plus a device sync, so under compile=True the previous
+        # debug print would have failed the compile outright. is_compiling() is
+        # traceable and folds to True during tracing, so the counter runs only
+        # on the eager path and the compiled graph stays whole.
+        if not torch.compiler.is_compiling():
+            _n_rescued = int((~keep).sum())
+            if _n_rescued:
+                _shiva_bump("keep_contested_rescue", _n_rescued)
         pred_masks_after = torch.where(
-            keep_mask, pred_masks, torch.clamp(pred_masks, max=-10.0)
+            keep_mask, pred_masks, pixel_level_non_overlapping_masks
         )
 
         return pred_masks_after

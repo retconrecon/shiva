@@ -1325,9 +1325,15 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         area_ratio = area_after / area_before
         keep = area_ratio >= shrink_threshold
         keep_mask = keep[..., None, None].expand_as(pred_masks)
-        pred_masks_after = torch.where(
-            keep_mask, pred_masks, torch.clamp(pred_masks, max=-10.0)
-        )
+        # KEEP-CONTESTED (Axovera, wave4). Twin of the change in
+        # video_tracking_multiplex_demo.py's inlined `_suppress_object_pw_area_shrinkage`. Both
+        # definitions are edited because which one is live depends on the tracker's MRO, and an
+        # edit to only the dormant one would report "no effect" for a treatment that never applied.
+        # Upstream deleted the object (`torch.clamp(pred_masks, max=-10.0)`); we hand it the
+        # partition it already won. `new_pred_masks` IS that partition, so an object that won
+        # nothing still ends up empty. No change on frames where every object clears the threshold.
+        # To revert: restore `torch.clamp(pred_masks, max=-10.0)`.
+        pred_masks_after = torch.where(keep_mask, pred_masks, new_pred_masks)
         return pred_masks_after
 
     def _suppress_object_pw_area_shrinkage(self, pred_masks):

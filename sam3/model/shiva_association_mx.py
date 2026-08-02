@@ -34,6 +34,7 @@ def associate_det_trk_botsort(
     HIGH_CONF_THRESH,   # float (0.8)
     use_iom,            # bool
     sentinel_status="GREEN",
+    crossing_active=False,  # bool — any identity-verifier pair mid-crossing
 ):
     """
     BoT-SORT IoU+appearance fusion with Hungarian optimal assignment.
@@ -188,7 +189,18 @@ def associate_det_trk_botsort(
                 if mask_np.sum() > 50:
                     obj_id = int(trk_obj_ids[trk_idx])
                     hist = appearance_store.extract_histogram(mask_np, frame_pixels)
-                    appearance_store.update(obj_id, hist)
+                    # SHIVA (2026-08): crossing_active was never passed by this, the
+                    # store's only caller, so it was always False. It guards the
+                    # force-reset escape hatch (shiva_appearance.py:130,
+                    # shiva_appearance_osnet.py:170), not the EMA update: after
+                    # max_consecutive_rejects rejected updates the store
+                    # re-seeds the embedding from the current observation. With
+                    # the guard dead, a long crossing could re-seed an identity
+                    # from a mid-overlap frame — contaminated by the other
+                    # animal — which is the worst possible moment to do it.
+                    appearance_store.update(
+                        obj_id, hist, crossing_active=crossing_active
+                    )
 
     # --- 8. Shape/dtype assertions ---
     assert trk_is_unmatched.shape == (M,) and trk_is_unmatched.dtype == torch.bool
@@ -200,6 +212,15 @@ def associate_det_trk_botsort(
     assert det_keep.shape == (N,) and det_keep.dtype == torch.bool
     assert im_mask.shape == (N, M) and im_mask.dtype == torch.bool
 
+    # --- 9. Overlap readout for the reconditioning gate ---
+    # The gate in sam3_multiplex_base tested `hasattr(adt_result, 'iou_matrix')`,
+    # which was ALWAYS False (LazyAssociateDetTrkResult has no such field and we
+    # never attached one), so its first-crossing-frame check was dead. Publish a
+    # scalar instead of the matrix: it survives _convert_to_numpy(), costs one
+    # sync on a path that already syncs at step 7, and keeps no tensor alive.
+    _real = iou_matrix[:, :num_real_trk]
+    max_det_trk_overlap = float(_real.max()) if _real.numel() > 0 else 0.0
+
     return LazyAssociateDetTrkResult(
         trk_is_unmatched=trk_is_unmatched,
         trk_is_nonempty=trk_is_nonempty,
@@ -209,4 +230,5 @@ def associate_det_trk_botsort(
         det_is_high_iou=det_is_high_iou,
         det_keep=det_keep,
         im_mask=im_mask,
+        max_det_trk_overlap=max_det_trk_overlap,
     )

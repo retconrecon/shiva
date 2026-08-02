@@ -32,6 +32,7 @@ from sam3.model.data_misc import BatchedDatapoint, NestedTensor
 from sam3.model.memory import SimpleMaskEncoder
 from sam3.model.multiplex_mask_decoder import MLP, MultiplexMaskDecoder
 from sam3.model.multiplex_utils import MultiplexController, MultiplexState
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
 from sam3.model.sam3_tracker_utils import (
     get_1d_sine_pe,
     get_next_point,
@@ -1304,8 +1305,32 @@ class VideoTrackingMultiplex(nn.Module):
         multiplex_state: MultiplexState,
     ):
         """Fuse the current frame's visual feature map with previous memory."""
+        # SHIVA (2026-08): upstream SAM 3.1 (commit 9f22cb9) switched B from the
+        # tensor's own batch dim to multiplex_state.num_buckets and left the
+        # original commented out below. The two desync when the tracked-object
+        # set transiently empties: the tensor arrives [HW, 0, C] while
+        # num_buckets is 1, and expand() cannot grow a size-0 dim to 1. That is
+        # the end-of-track crash
+        #   RuntimeError: The expanded size of the tensor (1) must match the
+        #   existing size (0) at non-singleton dimension 1
+        # reproduced on 2026-05-30 and currently worked around downstream by
+        # passing full video length and breaking in ZEUS's outer Python loop.
+        #
+        # expand() is only legal when the source dim is 1 or already equals the
+        # target, so honour num_buckets when it is expandable and otherwise fall
+        # back to the tensor's own batch dim (the pre-9f22cb9 semantics).
         B = multiplex_state.num_buckets
-        # B = current_vision_feats[-1].size(1)  # batch size on this frame
+        _feat_B = current_vision_feats[-1].size(1)
+        if _feat_B != B and _feat_B != 1:
+            if not getattr(self, "_shiva_warned_bucket_desync", False):
+                self._shiva_warned_bucket_desync = True
+                logging.warning(
+                    "SHIVA: vision-feature batch %d != num_buckets %d and is not "
+                    "broadcastable; falling back to the tensor's own batch dim. "
+                    "This is the empty-object-set case that crashes upstream.",
+                    _feat_B, B,
+                )
+            B = _feat_B
         vision_feat = current_vision_feats[-1].expand(-1, B, -1)
         vision_mask = (
             current_vision_masks[-1].expand(-1, B, -1)
@@ -1663,6 +1688,7 @@ class VideoTrackingMultiplex(nn.Module):
                         object_score_logits=object_score_logits.float(),
                     ).unsqueeze(1).to(_orig_dtype)
                 _tiab_handled = True
+                _shiva_bump('tiab_forward')
 
         if self.non_overlap_masks_for_mem_enc and not self.training and not _tiab_handled:
             # optionally, apply non-overlapping constraints to the masks (it's applied
@@ -1693,6 +1719,7 @@ class VideoTrackingMultiplex(nn.Module):
                 if _severely_clamped.any() and not _severely_clamped.all():
                     pred_masks_high_res = pred_masks_high_res.clone()
                     pred_masks_high_res[_severely_clamped] = -10.0
+                    _shiva_bump('memory_freeze_applied', int(_severely_clamped.sum()))
 
         if self.apply_sigmoid_to_mask_logits_for_mem_enc:
             # scale the raw mask logits with a temperature before applying sigmoid

@@ -108,6 +108,7 @@ class LazyAssociateDetTrkResult:
         det_is_high_iou: Tensor,
         det_keep: Tensor,
         im_mask: Tensor,
+        max_det_trk_overlap: Optional[float] = None,
     ):
         self.trk_is_unmatched = trk_is_unmatched
         self.trk_is_nonempty = trk_is_nonempty
@@ -117,6 +118,13 @@ class LazyAssociateDetTrkResult:
         self.det_is_high_iou = det_is_high_iou
         self.det_keep = det_keep
         self.im_mask = im_mask
+        # SHIVA: largest detection-vs-track overlap on this frame, as a plain
+        # Python float so it survives _convert_to_numpy() untouched. IoU or IoM
+        # depending on use_iom_recondition. None on the upstream association
+        # path, which does not compute it. Consumed by the reconditioning gate
+        # in sam3_multiplex_base to catch the first frame of a crossing, before
+        # SENTINEL (which lags one frame) has seen it.
+        self.max_det_trk_overlap = max_det_trk_overlap
 
     def _convert_to_numpy(self):
         with torch.profiler.record_function("Convert to numpy"):

@@ -18,6 +18,8 @@ import logging
 import cv2
 import numpy as np
 
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,10 +121,15 @@ class ShivaAppearanceStore:
                     + (1 - self.ema_alpha) * histogram
                 )
                 self._consecutive_rejects[obj_id] = 0
+                _shiva_bump('appearance_update')
             else:
                 self._consecutive_rejects[obj_id] = (
                     self._consecutive_rejects.get(obj_id, 0) + 1
                 )
+                _shiva_bump('appearance_rejected_far')
+                if (self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects
+                        and crossing_active):
+                    _shiva_bump('appearance_frozen_by_crossing')
                 # Force-reset after too many consecutive rejects to unstick
                 # embeddings frozen by undetected swaps or lighting changes.
                 # Suppress during crossings — current observation is likely

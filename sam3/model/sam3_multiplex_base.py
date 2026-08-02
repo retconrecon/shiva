@@ -24,6 +24,7 @@ from sam3.model.sam3_video_base import (
     RealizedAssociateDetTrkresult,
     Sam3VideoBase,
 )
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
 from sam3.perflib.masks_ops import mask_iou
 from sam3.train.masks_ops import rle_encode
 from torch import nn, Tensor
@@ -32,6 +33,14 @@ from torch import nn, Tensor
 SAM3_COLLECTIVE_OP_TIMEOUT_SEC = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC", "180"))
 
 logger = get_logger(__name__)
+
+# SHIVA: overlap above which the reconditioning gate treats the current frame as
+# the first frame of a crossing, before SENTINEL (which lags one frame) reports
+# it. Compared against max_det_trk_overlap, which is IoM when
+# use_iom_recondition is True (the SHIVA default, model_builder.py) and IoU
+# otherwise — IoM runs higher for a given geometry, so this is deliberately
+# conservative rather than retuned per metric.
+SHIVA_IMMEDIATE_OVERLAP_THRESH = 0.3
 
 if torch.cuda.get_device_properties(0).major >= 8:
     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
@@ -1141,14 +1150,20 @@ class Sam3MultiplexBase(Sam3VideoBase):
             # Immediate IoU check: suppress if any detection-track pair has
             # high IoU overlap, catching the first crossing frame before
             # SENTINEL updates (SENTINEL lags by one frame)
+            # SHIVA (2026-08): this read `adt_result.iou_matrix`, a field that does
+            # not exist on LazyAssociateDetTrkResult, so the hasattr guard was
+            # always False and this check never ran. The BoT-SORT path now
+            # publishes max_det_trk_overlap (shiva_association_mx.py step 9).
             _immediate_overlap = False
-            if adt_result is not None and hasattr(adt_result, 'iou_matrix'):
-                _iou_mx = adt_result.iou_matrix
-                if _iou_mx is not None and _iou_mx.numel() > 0:
-                    _immediate_overlap = bool(_iou_mx.max() > 0.3)
+            _max_ov = getattr(adt_result, 'max_det_trk_overlap', None)
+            if _max_ov is not None:
+                _immediate_overlap = _max_ov > SHIVA_IMMEDIATE_OVERLAP_THRESH
+                if _immediate_overlap:
+                    _shiva_bump('immediate_overlap_suppressed')
             if _suppress or _crossing_states or _immediate_overlap:
                 should_recondition_periodic = False
                 should_recondition_iou = False
+                _shiva_bump('recondition_suppressed')
 
         # Recondition if periodic or IoU condition met
         if should_recondition_periodic or should_recondition_iou:
@@ -1935,6 +1950,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
         ):
             from sam3.model.shiva_association_mx import associate_det_trk_botsort
             num_real_trk = len(trk_obj_ids)
+            _shiva_bump('botsort_association')
             # Do NOT pad trk_masks — BoT-SORT returns tensors sized to
             # num_real_trk, matching what _process_hotstart_gpu expects.
             # (Padding to max_num_objects is only for _associate_det_trk_compilable)
@@ -1953,6 +1969,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 HIGH_CONF_THRESH=HIGH_CONF_THRESH,
                 use_iom=self.use_iom_recondition,
                 sentinel_status=self._shiva_sentinel_status,
+                crossing_active=getattr(self, '_shiva_crossing_active', False),
             )
 
         assert det_masks.is_floating_point(), "float tensor expected (do not binarize)"

@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from sam3.model.shiva_appearance import histogram_intersection_distance
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
 
 logger = logging.getLogger(__name__)
 
@@ -163,10 +164,15 @@ class ShivaOSNetAppearanceStore:
                 if norm > 1e-8:
                     self.embeddings[obj_id] /= norm
                 self._consecutive_rejects[obj_id] = 0
+                _shiva_bump('appearance_update')
             else:
                 self._consecutive_rejects[obj_id] = (
                     self._consecutive_rejects.get(obj_id, 0) + 1
                 )
+                _shiva_bump('appearance_rejected_far')
+                if (self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects
+                        and crossing_active):
+                    _shiva_bump('appearance_frozen_by_crossing')
                 if (self._consecutive_rejects[obj_id] >= self._max_consecutive_rejects
                         and not crossing_active):
                     self.embeddings[obj_id] = embedding.copy()
