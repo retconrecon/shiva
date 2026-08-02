@@ -66,11 +66,32 @@ if hits:
     fails.append("dangling imports:\n  " + "\n  ".join(hits))
 print(f"2. dangling imports to removed modules: {len(hits)}")
 
-# 3. ShivaTracker accepts exactly ZEUS's call and nothing dead.
+# 3. ShivaTracker accepts exactly what the PRODUCTION caller passes, and nothing dead.
+#
+# ☢ THIS CHECK WAS WRONG UNTIL 2026-08-02. It validated against zeus_tracking/track.py, which
+# passes 6 kwargs. The caller that actually runs the fleet is axovera-deploy's
+# `services/zeus/axovera_zeus/nodes/shiva_223e.py`, which passes 12 and REFUSES TO RUN when the
+# fork does not accept one that was explicitly requested (its `_fatal` check). Validating the
+# wrong caller let a signature through that ZEUS could not construct at all -- caught only when
+# a real launch was attempted. If you add a caller, add it here.
 sig = inspect.signature(ShivaTracker.__init__)
 params = set(sig.parameters) - {"self"}
+# zeus_tracking/track.py
 zeus_uses = {"predictor", "session_id", "frame_dir", "n_animals",
              "pixel_paint_enabled", "n_frames"}
+# axovera-deploy shiva_223e.py: kwargs it may pass. Those NOT accepted here are dropped by its
+# signature filter, which is fine -- but only while their controlling env var is at its default.
+# Listed so a future reader sees the full production surface rather than rediscovering it on a pod.
+zeus223e_may_pass = {
+    "pixel_paint_enabled", "max_recent_frames", "max_landmark_frames", "n_frames",
+    "occlusion_memory_freeze", "occlusion_freeze_threshold", "identity_verification",
+    "tiab_enabled", "tiab_checkpoint", "tiab_to_output", "motion_prior", "motion_cfg",
+}
+# Anything in BOTH sets must be accepted; the rest are droppable-at-default by design.
+must_accept = zeus_uses | (zeus223e_may_pass & params)
+if must_accept - params:
+    fails.append(f"ShivaTracker rejects kwargs a production caller passes: "
+                 f"{sorted(must_accept - params)}")
 dead = {"botsort_enabled", "identity_verification", "appearance_backend",
         "confidence_injection", "confidence_threshold", "occlusion_memory_freeze",
         "occlusion_freeze_threshold", "temporal_boundary_prior", "tiab_enabled",
