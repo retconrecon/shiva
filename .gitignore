@@ -151,3 +151,6 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+# Durable scratch (per-worktree working scratch; never committed)
+.scratch/
