@@ -35,6 +35,9 @@ import cv2
 import numpy as np
 import torch
 
+from sam3.model import shiva_instrumentation
+from sam3.model.shiva_closed_world import evaluate_frame as _closed_world_eval
+from sam3.model.shiva_instrumentation import bump as _shiva_bump
 from sam3.model.shiva_memory_pruning import prune_output_dict
 from sam3.model.shiva_pixel_paint import ShivaPixelPaintRecovery
 
@@ -74,9 +77,12 @@ class ShivaTracker:
     def __enter__(self):
         return self
 
+    _MAX_CW_LOG = 5000
+
     # Attributes set on the model that must be cleaned up between sessions
     _SHIVA_MODEL_ATTRS = [
         '_shiva_sentinel_status', '_shiva_crossing_active',
+        '_shiva_map_prior', '_shiva_prev_labels', '_shiva_map_prior_warned',
         'use_botsort_association', '_shiva_appearance_store',
         '_shiva_frame_pixels', '_prev_non_overlap_assignment',
         '_prev_non_overlap_batch_size',
@@ -91,6 +97,17 @@ class ShivaTracker:
     ]
 
     def __exit__(self, *exc):
+        # 2026-08: print the hook truth table before tearing anything down, so a
+        # feature that was requested but never executed is impossible to miss.
+        # See shiva_instrumentation for why this is not optional hygiene.
+        try:
+            logger.info(
+                "%s", shiva_instrumentation.format_report(
+                    only_expected=self._expected_hooks
+                )
+            )
+        except Exception as e:  # never let reporting break teardown
+            logger.debug("Instrumentation report failed: %s", e)
         # Clean up model attributes to prevent bleed into next session
         if self._model is not None:
             for attr in self._SHIVA_MODEL_ATTRS:
@@ -125,6 +142,9 @@ class ShivaTracker:
                  temporal_boundary_prior=0.0,
                  tiab_enabled=False, tiab_checkpoint=None,
                  tiab_appearance_dim=512, tiab_trajectory_len=16,
+                 motion_prior=False, motion_process_std=0.004,
+                 motion_measurement_std=0.004, motion_max_jump=0.12,
+                 motion_cfg=None,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -138,6 +158,48 @@ class ShivaTracker:
         self.occlusion_freeze_threshold = occlusion_freeze_threshold
         self.temporal_boundary_prior = temporal_boundary_prior
         self.identity_verification = identity_verification
+
+        # Motion model. Default OFF so this cannot regress an existing
+        # run; turning it on is the whole A/B.
+        self.motion = None
+        self.motion_cfg = None
+        if motion_prior:
+            from sam3.model.shiva_motion import ShivaMotionModel
+            from sam3.model.shiva_map_partition import MapPartitionConfig
+            self.motion = ShivaMotionModel(
+                process_std=motion_process_std,
+                measurement_std=motion_measurement_std,
+                max_jump=motion_max_jump,
+            )
+            self.motion_cfg = motion_cfg or MapPartitionConfig()
+            logger.info(
+                'MAP motion prior enabled (lambda_max=%.2f, tau=%.2f, '
+                'w_centroid=%.2f, w_persist=%.2f)',
+                self.motion_cfg.lambda_max, self.motion_cfg.margin_tau,
+                self.motion_cfg.w_centroid, self.motion_cfg.w_persist,
+            )
+
+        # 2026-08: counters are per-session, and every flag the caller turned on
+        # becomes a claim we check at teardown. A flag is a request; a nonzero
+        # counter is the only evidence the feature ran.
+        shiva_instrumentation.reset()
+        self._expected_hooks = []
+        if botsort_enabled:
+            self._expected_hooks += ['botsort_association', 'appearance_update']
+        if identity_verification:
+            self._expected_hooks.append('identity_swap_detected')
+        if pixel_paint_enabled:
+            self._expected_hooks.append('pixel_paint_recovery')
+        if confidence_injection:
+            self._expected_hooks.append('confidence_injection')
+        if occlusion_memory_freeze:
+            self._expected_hooks.append('memory_freeze_applied')
+        if temporal_boundary_prior > 0:
+            self._expected_hooks.append('temporal_boundary_prior')
+        if tiab_enabled:
+            self._expected_hooks.append('tiab_forward')
+        if motion_prior:
+            self._expected_hooks += ['motion_observe', 'map_partition_frames_active']
 
         # Access inference_state through predictor internals
         session = predictor._all_inference_states.get(session_id)
@@ -245,6 +307,10 @@ class ShivaTracker:
                         sum(p.numel() for p in tiab_module.parameters()))
 
         self.prune_stats = []
+        # Rolling log of frames that failed the closed-world check. Capped so a
+        # 60k-frame run cannot grow it without bound; the counters in
+        # shiva_instrumentation carry the totals.
+        self.closed_world_violations = []
         self._applied_swaps = set()  # deduplication for apply_swap
 
         # Derive healthy area threshold from pixel-paint so SENTINEL and
@@ -426,6 +492,32 @@ class ShivaTracker:
                             if cx is not None:
                                 self.pixel_paint.update_last_centroid(oid, cx, cy)
 
+                # Closed-world constraint check. Read-only: it cannot change
+                # tracking, so it stays on. This is the per-frame signal the
+                # pipeline has never had -- coverage_full measures presence and
+                # is blind to a mask parked on the wrong animal, and the
+                # tracker's own swap counter reads 0 on a video with three
+                # confirmed swaps. Without this an A/B compares coverage; with
+                # it, an A/B counts constraint violations.
+                cw_report = _closed_world_eval(
+                    frame_idx, frame_bool, self.n_animals,
+                    median_areas=(
+                        self.pixel_paint.median_areas if self.pixel_paint else None
+                    ),
+                )
+                if not cw_report.ok:
+                    self.closed_world_violations.append(cw_report)
+                    if len(self.closed_world_violations) > self._MAX_CW_LOG:
+                        self.closed_world_violations.pop(0)
+
+                # Feed this frame's centroids to the motion model and publish
+                # the prediction the NEXT frame's contested-pixel partition
+                # will use. Deliberately after the centroid update above and
+                # before the yield, so the prior is in place when the generator
+                # advances.
+                if self.motion is not None:
+                    self._update_motion_prior(frame_bool)
+
                 # Auto-update SENTINEL status for BoT-SORT adaptive gating
                 # Uses per-object adaptive threshold from pixel-paint so SENTINEL
                 # agrees with pixel-paint on what constitutes a healthy mask
@@ -484,8 +576,10 @@ class ShivaTracker:
                         self._model._shiva_sentinel_status = "GREEN"
                     elif n_healthy >= self.n_animals - 1:
                         self._model._shiva_sentinel_status = "YELLOW"
+                        _shiva_bump('sentinel_yellow')
                     else:
                         self._model._shiva_sentinel_status = "RED"
+                        _shiva_bump('sentinel_red')
 
                 # Memory pruning
                 stats = prune_output_dict(
@@ -504,6 +598,8 @@ class ShivaTracker:
                     recovery_masks = self.pixel_paint.check_and_recover(
                         frame_idx, frame_bool, frame_bgr=frame_bgr,
                     )
+                    if recovery_masks:
+                        _shiva_bump('pixel_paint_recovery', len(recovery_masks))
                     # Mark yielded recoveries as applied in the log
                     if recovery_masks and self.pixel_paint.recovery_log:
                         for entry in self.pixel_paint.recovery_log[-len(recovery_masks):]:
@@ -551,10 +647,12 @@ class ShivaTracker:
                 # Pass recovery_masks so injector doesn't claim blobs already
                 # assigned by pixel-paint
                 if self.injector is not None:
-                    self.injector.check_and_inject(
+                    _injected = self.injector.check_and_inject(
                         frame_idx, frame_bool, frame_bgr=frame_bgr,
                         already_claimed=recovery_masks,
                     )
+                    if _injected:
+                        _shiva_bump('confidence_injection', len(_injected))
 
                 # Identity verification — detect swaps after crossings
                 # Filter out artifact masks to prevent false crossing events
@@ -576,6 +674,8 @@ class ShivaTracker:
                             frame_idx, healthy_for_verifier, pairwise_ious,
                             frame_bgr=frame_bgr,
                         )
+                        if swap_events:
+                            _shiva_bump('identity_swap_detected', len(swap_events))
                     # Signal to reconditioning gate whether any crossing is active
                     if self._model is not None:
                         states = self.verifier.get_crossing_states()
@@ -727,7 +827,117 @@ class ShivaTracker:
             elif oid_a in self._centroid_history:
                 del self._centroid_history[oid_a]
 
+        # The motion model must follow the correction, or it keeps
+        # asserting the pre-swap trajectory for both animals and fights it.
+        if self.motion is not None:
+            self.motion.swap(oid_a, oid_b)
+        _shiva_bump('identity_swap_applied')
         logger.info("Applied swap: oid %d <-> %d", oid_a, oid_b)
+
+    def _ordered_oids(self, frame_bool):
+        """Object ids in SAM3's batch order, so a [B, ...] tensor lines up with
+        the batch dimension of pred_masks. Same convention as the TIAB path."""
+        _obj_id_to_idx = None
+        for s in self._inference_state.get("sam2_inference_states", []):
+            if "obj_id_to_idx" in s:
+                _obj_id_to_idx = s["obj_id_to_idx"]
+                break
+        if _obj_id_to_idx is not None:
+            return sorted(
+                [oid for oid in frame_bool if oid in _obj_id_to_idx],
+                key=lambda o: _obj_id_to_idx[o],
+            )
+        return sorted(frame_bool.keys())
+
+    def _update_motion_prior(self, frame_bool):
+        """Advance the motion model and publish next frame's MAP prior.
+
+        Order is the standard filter loop, arranged around the one hook we
+        have: the filters are already at prior-for-t (predicted at the end of
+        t-1), so observe first to get the posterior at t, then predict to get
+        the prior for t+1, then publish that.
+
+        A mask that is empty or below the artifact threshold is routed to
+        miss() rather than observe(): updating from an in-occlusion mask is
+        fitting the corruption, and it is exactly the mechanism that would make
+        this prior reinforce a takeover instead of resisting one.
+        """
+        import torch as _torch
+
+        _inner = self._model
+        if hasattr(self._model, 'tracker') and hasattr(self._model.tracker, 'model'):
+            _inner = self._model.tracker.model
+
+        h = self._inference_state.get("orig_height", 1008)
+        w = self._inference_state.get("orig_width", 1008)
+
+        oids = self._ordered_oids(frame_bool)
+
+        # --- observe ---
+        for oid in oids:
+            m = frame_bool[oid]
+            area = int(m.sum())
+            healthy = area > 0
+            if healthy and self.pixel_paint is not None:
+                median = self.pixel_paint.median_areas.get(oid)
+                if median is not None and area < median * self.pixel_paint.area_lower:
+                    healthy = False
+            if not healthy:
+                self.motion.observe(oid, None)
+                _shiva_bump('motion_miss')
+                continue
+            cx, cy = ShivaPixelPaintRecovery._largest_component_centroid(m)
+            if cx is None:
+                self.motion.observe(oid, None)
+                _shiva_bump('motion_miss')
+            else:
+                if self.motion.observe(oid, (cx / w, cy / h)):
+                    _shiva_bump('motion_observe')
+                else:
+                    # Rejected as an implausible jump, i.e. the mask probably
+                    # landed on a neighbour. Worth counting on its own.
+                    _shiva_bump('motion_jump_rejected')
+
+        # --- predict for the next frame ---
+        preds = self.motion.predict()
+
+        B = len(oids)
+        if B == 0:
+            _inner._shiva_map_prior = None
+            return
+
+        dev = "cuda" if _torch.cuda.is_available() else "cpu"
+        centroids = _torch.zeros(B, 2, dtype=_torch.float32, device=dev)
+        sigmas = _torch.full((B,), 1.0, dtype=_torch.float32, device=dev)
+        velocities = _torch.zeros(B, 2, dtype=_torch.float32, device=dev)
+        valid = _torch.zeros(B, dtype=_torch.bool, device=dev)
+
+        for i, oid in enumerate(oids):
+            p = preds.get(oid)
+            f = self.motion.filters.get(oid)
+            if p is None or f is None:
+                continue
+            # Drop the prior for a track that has been coasting too long: past
+            # some horizon the extrapolation is fiction and asserting it would
+            # be worse than deferring to appearance.
+            if f.misses > self.motion_cfg.max_coast_frames:
+                _shiva_bump('motion_prior_dropped_stale')
+                continue
+            centroids[i, 0] = p[0]
+            centroids[i, 1] = p[1]
+            sigmas[i] = p[2]
+            velocities[i, 0] = float(f.x[2])
+            velocities[i, 1] = float(f.x[3])
+            valid[i] = True
+
+        _inner._shiva_map_prior = {
+            "batch_size": B,
+            "centroids": centroids,
+            "sigmas": sigmas,
+            "velocities": velocities,
+            "valid": valid,
+            "cfg": self.motion_cfg,
+        }
 
     def _update_tiab_attributes(self, frame_bool, frame_bgr):
         """Set per-frame TIAB attributes on the inner model.
