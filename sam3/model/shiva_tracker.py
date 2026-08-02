@@ -96,16 +96,63 @@ class ShivaTracker:
         '_tiab_extractor', '_tiab_extract_buffer', '_tiab_original_encode',
     ]
 
+    def diagnostics(self):
+        """Machine-readable summary of what actually happened this session."""
+        counters = shiva_instrumentation.snapshot()
+        by_type = {}
+        for r in self.closed_world_violations:
+            for v in r.violations:
+                key = v.split(" ")[0] if v[0].isdigit() else " ".join(v.split(" ")[:2])
+                by_type[key] = by_type.get(key, 0) + 1
+        return {
+            "counters": counters,
+            "requested_hooks": list(self._expected_hooks),
+            "silent_requested_hooks": [
+                h for h in self._expected_hooks if counters.get(h, 0) == 0
+            ],
+            "closed_world": {
+                "violation_frames_logged": len(self.closed_world_violations),
+                "log_capped_at": self._MAX_CW_LOG,
+                "by_type": by_type,
+                "first_violations": [
+                    str(r) for r in self.closed_world_violations[:20]
+                ],
+            },
+        }
+
     def __exit__(self, *exc):
-        # 2026-08: print the hook truth table before tearing anything down, so a
-        # feature that was requested but never executed is impossible to miss.
-        # See shiva_instrumentation for why this is not optional hygiene.
+        # 2026-08: surface the diagnostics before tearing anything down.
+        #
+        # This PRINTS rather than only logging, deliberately. ZEUS's track.py
+        # configures no logging at all, so the root logger sits at WARNING and a
+        # logger.info() report would produce nothing -- which is precisely the
+        # silent-failure pattern this instrumentation exists to catch. A
+        # diagnostic that depends on the caller configuring logging, or on the
+        # caller remembering to read an attribute, is a diagnostic that will not
+        # fire when it matters. Self-surfacing is the whole point.
         try:
-            logger.info(
-                "%s", shiva_instrumentation.format_report(
-                    only_expected=self._expected_hooks
-                )
+            report = shiva_instrumentation.format_report(
+                only_expected=self._expected_hooks
             )
+            cw = self.closed_world_violations
+            if cw:
+                report += (
+                    f"\nCLOSED-WORLD: {len(cw)} frame(s) violated the exactly-N "
+                    f"permutation constraint"
+                    + (" (log capped)" if len(cw) >= self._MAX_CW_LOG else "")
+                    + "\n  first: " + str(cw[0])
+                    + "\n  last:  " + str(cw[-1])
+                )
+            else:
+                report += "\nCLOSED-WORLD: no violations detected."
+            print(report, flush=True)
+            logger.info("%s", report)
+            if self.diagnostics_path:
+                import json
+                with open(self.diagnostics_path, "w") as f:
+                    json.dump(self.diagnostics(), f, indent=2)
+                print(f"[shiva] diagnostics written to {self.diagnostics_path}",
+                      flush=True)
         except Exception as e:  # never let reporting break teardown
             logger.debug("Instrumentation report failed: %s", e)
         # Clean up model attributes to prevent bleed into next session
@@ -144,7 +191,7 @@ class ShivaTracker:
                  tiab_appearance_dim=512, tiab_trajectory_len=16,
                  motion_prior=False, motion_process_std=0.004,
                  motion_measurement_std=0.004, motion_max_jump=0.12,
-                 motion_cfg=None,
+                 motion_cfg=None, diagnostics_path=None,
                  n_frames=None):
         self.predictor = predictor
         self.session_id = session_id
@@ -158,6 +205,9 @@ class ShivaTracker:
         self.occlusion_freeze_threshold = occlusion_freeze_threshold
         self.temporal_boundary_prior = temporal_boundary_prior
         self.identity_verification = identity_verification
+        # Optional JSON dump of the end-of-run diagnostics. The truth table is
+        # printed regardless; this makes it machine-readable for an A/B.
+        self.diagnostics_path = diagnostics_path
 
         # Motion model. Default OFF so this cannot regress an existing
         # run; turning it on is the whole A/B.
