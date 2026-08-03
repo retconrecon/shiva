@@ -2609,6 +2609,16 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 # object is worse than not gating: it would write a no-object memory for a
                 # healthy track. Skip, and count it so the skip is visible.
                 SHIVA_MEM_GATE_STATS["skipped_unalignable"] += 1
+        # SHIVA_MEM_SCORE_DUMP=1: print the learned per-object scores each frame so a gate
+        # threshold can be chosen from the OBSERVED distribution instead of a constant borrowed
+        # from a different metric (exp050's lesson: SAM2Long's 0.3 is a predicted-IoU threshold;
+        # this score is a probability, and on elephants it never went below 0.3 in 867 samples).
+        if os.environ.get("SHIVA_MEM_SCORE_DUMP") == "1":
+            _sc_dump = tracker_metadata.get("obj_id_to_score") or {}
+            if _sc_dump:
+                print("[memscore] f=%s %s" % (frame_idx, " ".join(
+                    "%d:%.4f" % (int(k), float(v)) for k, v in sorted(_sc_dump.items()))),
+                    flush=True)
 
         if self.is_multiplex and self.tracker.is_multiplex_dynamic:
             # The objects in the masks are ordered w.r.t. object IDs,
