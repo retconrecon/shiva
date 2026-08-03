@@ -23,6 +23,16 @@ from sam3.model.edt import edt_triton
 # constant; 0.0 (default) is arithmetically identical to upstream.
 MASK_LOGIT_THRESHOLD = float(os.environ.get("SHIVA_MASK_THRESHOLD", "0.0"))
 
+# exp048 memory-admission gating counters. Lives here (the leaf module) for the same reason the
+# threshold does: every consumer already imports this file, so there is exactly one definition.
+# `refused` is the evidence the gate did anything - a run with refused == 0 gated nothing, no
+# matter what SHIVA_MEM_MIN_SCORE says. `skipped_unalignable` must stay at 0 in a healthy run;
+# nonzero means scores could not be aligned to masks and gating was correctly declined rather
+# than applied to the wrong object.
+SHIVA_MEM_GATE_STATS = {
+    "frames": 0, "considered": 0, "refused": 0, "skipped_unalignable": 0,
+}
+
 
 def sample_box_points(
     masks: torch.Tensor,

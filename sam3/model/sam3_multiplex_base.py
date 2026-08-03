@@ -19,6 +19,7 @@ from sam3.model.sam3_tracker_utils import (
     fill_holes_in_mask_scores,
     mask_to_box,
     MASK_LOGIT_THRESHOLD,
+    SHIVA_MEM_GATE_STATS,
 )
 from sam3.model.sam3_video_base import (
     _associate_det_trk_compilable,
@@ -2562,6 +2563,52 @@ class Sam3MultiplexBase(Sam3VideoBase):
         object_score_logits = torch.where(
             (high_res_masks > 0).any(dim=(-1, -2)), 10.0, -10.0
         )
+
+        # ☢ SHIVA_MEM_MIN_SCORE: MEMORY ADMISSION GATING (exp048). Default 0.0 = upstream.
+        #
+        # The line above is the entire quality control on this tracker's memory bank, and it is
+        # ONE BIT: "does this mask have any pixels at all". A pixel-perfect mask scores +10; a
+        # mask that is 3% of the animal also scores +10; only a fully empty mask scores -10.
+        # Every non-empty mask, however degraded, is therefore encoded into memory at maximum
+        # confidence and conditions every subsequent frame. That is a compounding-error engine:
+        # a truncated mask is admitted at +10, the next frame conditions on it and truncates
+        # further, and the area proxy never notices because area barely moves (measured on
+        # sa_fari_000702: ZEUS 70413 px vs baseline 70731 px on a frame where box-IoU was
+        # 0.412 vs 0.984 - the shape was wrong, the area was not).
+        #
+        # The fix costs nothing because the signal already exists and is already in this
+        # function's arguments: `tracker_metadata["obj_id_to_score"]` is the tracker's LEARNED
+        # per-object confidence, computed upstream (:1277) and thrown away here. When the env
+        # var is set we consult it and write a no-object memory (-10) for any object below the
+        # threshold, so a low-confidence frame stops poisoning the bank and the object coasts on
+        # prior memory instead. SAM2Long's object-aware memory is the same idea (admit on
+        # score > 0 and predicted IoU > 0.3) and is the best-evidenced result in the VOS
+        # literature: 24/24 head-to-head wins, +4.5 J&F.
+        #
+        # Counters, not faith: SHIVA_MEM_GATE_STATS records how many object-frames were refused.
+        # A run whose `refused` is 0 did not gate anything, whatever the env var says.
+        _mem_min = float(os.environ.get("SHIVA_MEM_MIN_SCORE", "0.0"))
+        if _mem_min > 0.0:
+            _scores = tracker_metadata.get("obj_id_to_score") or {}
+            _ids = tracker_metadata.get("obj_ids_all_gpu")
+            if len(_scores) and _ids is not None and len(_ids) == object_score_logits.shape[0]:
+                _keep = torch.tensor(
+                    [float(_scores.get(int(o), 1.0)) >= _mem_min for o in _ids],
+                    device=object_score_logits.device,
+                )
+                _refused = int((~_keep).sum())
+                if _refused:
+                    SHIVA_MEM_GATE_STATS["refused"] += _refused
+                    object_score_logits = torch.where(
+                        _keep, object_score_logits, torch.full_like(object_score_logits, -10.0)
+                    )
+                SHIVA_MEM_GATE_STATS["considered"] += int(len(_ids))
+                SHIVA_MEM_GATE_STATS["frames"] += 1
+            else:
+                # Shape/key mismatch means we cannot align scores to masks. Gating the WRONG
+                # object is worse than not gating: it would write a no-object memory for a
+                # healthy track. Skip, and count it so the skip is visible.
+                SHIVA_MEM_GATE_STATS["skipped_unalignable"] += 1
 
         if self.is_multiplex and self.tracker.is_multiplex_dynamic:
             # The objects in the masks are ordered w.r.t. object IDs,
