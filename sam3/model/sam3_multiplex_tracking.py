@@ -14,7 +14,7 @@ from sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
 from sam3.model.data_misc import BatchedDatapoint
 from sam3.model.sam3_multiplex_base import MaskletConfirmationStatus, Sam3MultiplexBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
-from sam3.model.sam3_video_inference import is_image_type
+from sam3.model.sam3_video_inference import is_image_type, MASK_LOGIT_THRESHOLD
 from sam3.perflib.compile import (
     clone_output_wrapper,
     compile_wrapper,
@@ -1567,7 +1567,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 align_corners=False,
             )  # (num_objects, 1, H_video, W_video)
             for i, obj_id in enumerate(new_det_obj_ids_local):
-                obj_id_to_mask[obj_id] = (video_res_masks[i] > 0.0).to(torch.bool)
+                obj_id_to_mask[obj_id] = (video_res_masks[i] > MASK_LOGIT_THRESHOLD).to(
+                    torch.bool
+                )
         if self.rank == 0:
             for fidx in range(inference_state["num_frames"]):
                 self._cache_frame_outputs(inference_state, fidx, obj_id_to_mask)
@@ -3021,7 +3023,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         # fetch results from states and gather across GPUs
         # Use optimized caching approach to avoid reprocessing unmodified objects
         if self.rank == obj_rank and len(obj_ids) > 0:
-            new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(
+            new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > MASK_LOGIT_THRESHOLD).to(
                 torch.bool
             )
         else:
@@ -3142,7 +3144,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         )  # (1, H_video, W_video)
 
         # Convert to boolean - already in the right shape!
-        return (video_res_mask.squeeze(0) > 0.0).to(torch.bool)
+        return (video_res_mask.squeeze(0) > MASK_LOGIT_THRESHOLD).to(torch.bool)
 
     def clear_detector_added_cond_frame_in_sam2(
         self, sam2_state, obj_id, refined_frame_idx

@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import logging
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -25,6 +26,19 @@ from torchvision.ops import masks_to_boxes
 from tqdm.auto import tqdm
 
 logger = get_logger(__name__)
+
+# SHIVA_MASK_THRESHOLD: logit threshold for binarizing video-resolution mask logits at the OUTPUT
+# seam (every `> threshold` emit site in this file and sam3_multiplex_tracking.py). Upstream
+# hardcodes 0.0. Thin extremities live in the low-|logit| band and are the first pixels lost at
+# 0.0 (measured on sa_fari_000702/exp036: a 3-7 px tail sliver, absent from 4 frames, moved
+# box-IoU 0.98 -> 0.41); a small negative value recovers that band at zero compute. Read once at
+# import so the value is a compile-time constant; 0.0 (the default) is arithmetically identical
+# to upstream, so an unset env var cannot change behavior.
+MASK_LOGIT_THRESHOLD = float(os.environ.get("SHIVA_MASK_THRESHOLD", "0.0"))
+if MASK_LOGIT_THRESHOLD != 0.0:
+    logger.info(
+        f"SHIVA_MASK_THRESHOLD active: output masks binarize at logit > {MASK_LOGIT_THRESHOLD}"
+    )
 
 
 class Sam3VideoInference(Sam3VideoBase):
@@ -773,7 +787,9 @@ class Sam3VideoInference(Sam3VideoBase):
                 align_corners=False,
             )  # (num_objects, 1, H_video, W_video)
             for i, obj_id in enumerate(new_det_obj_ids_local):
-                obj_id_to_mask[obj_id] = (video_res_masks[i] > 0.0).to(torch.bool)
+                obj_id_to_mask[obj_id] = (video_res_masks[i] > MASK_LOGIT_THRESHOLD).to(
+                    torch.bool
+                )
         if self.rank == 0:
             for fidx in range(inference_state["num_frames"]):
                 self._cache_frame_outputs(inference_state, fidx, obj_id_to_mask)
@@ -1566,7 +1582,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         # fetch results from states and gather across GPUs
         # Use optimized caching approach to avoid reprocessing unmodified objects
         if self.rank == obj_rank and len(obj_ids) > 0:
-            new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(
+            new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > MASK_LOGIT_THRESHOLD).to(
                 torch.bool
             )
         else:
@@ -1673,7 +1689,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         )  # (1, H_video, W_video)
 
         # Convert to boolean - already in the right shape!
-        return (video_res_mask.squeeze(0) > 0.0).to(torch.bool)
+        return (video_res_mask.squeeze(0) > MASK_LOGIT_THRESHOLD).to(torch.bool)
 
     def clear_detector_added_cond_frame_in_tracker(
         self, tracker_state, obj_id, refined_frame_idx
