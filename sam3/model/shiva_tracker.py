@@ -275,7 +275,7 @@ class ShivaTracker:
                 vmin, vmax, _DENORM_MEAN, _DENORM_STD,
             )
 
-    def track(self, n_frames=None, propagation_direction="forward"):
+    def track(self, n_frames=None, propagation_direction="forward", start_frame_index=0):
         """Run SAM3.1 propagation with SHIVA hooks.
 
         Yields:
@@ -283,6 +283,16 @@ class ShivaTracker:
             - outputs: SAM3.1 output dict
             - recovery_masks: {oid: bool_mask} from pixel-paint, empty if healthy
             - swap_events: list of SwapEvent from identity verifier, empty if none
+
+        start_frame_index was previously HARDCODED to 0, which silently made
+        propagation_direction="backward" a no-op: a reverse pass anchored at frame 0 has
+        nowhere to go. That matters because the clips whose extremities truncate are seeded
+        at frame 0, so "bidirectional from the seed" cannot help them - the useful second
+        pass is anchored at the END and walks backward, accumulating its truncation in the
+        opposite temporal direction so a union recovers what either pass alone loses.
+        Measured motivation: sa_fari_000702 loses a 3-7px tail on frames 67-77 of 80; a pass
+        anchored at 79 is freshest exactly there. Default 0 keeps every existing caller
+        byte-identical.
         """
         # Sync memory freeze flags to the INNER tracker model
         if self._model is not None:
@@ -298,7 +308,7 @@ class ShivaTracker:
             "type": "propagate_in_video",
             "session_id": self.session_id,
             "propagation_direction": propagation_direction,
-            "start_frame_index": 0,
+            "start_frame_index": int(start_frame_index),
         }
         if n_frames is not None:
             request["max_frame_num_to_track"] = n_frames
