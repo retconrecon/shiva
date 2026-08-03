@@ -21,7 +21,11 @@ from sam3 import perflib
 from sam3.logger import get_logger
 from sam3.model.box_ops import fast_diag_box_iou
 from sam3.model.data_misc import BatchedDatapoint
-from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores, mask_to_box
+from sam3.model.sam3_tracker_utils import (
+    fill_holes_in_mask_scores,
+    mask_to_box,
+    MASK_LOGIT_THRESHOLD,
+)
 from sam3.perflib.masks_ops import mask_iou
 from sam3.train.masks_ops import mask_iom, rle_encode
 from torch import nn, Tensor
@@ -1197,7 +1201,7 @@ class Sam3VideoBase(nn.Module):
             mode="bilinear",
             align_corners=False,
         )  # (num_obj, 1, H_video, W_video)
-        existing_masklet_binary = existing_masklet_video_res_masks > 0
+        existing_masklet_binary = existing_masklet_video_res_masks > MASK_LOGIT_THRESHOLD
         assert len(existing_masklet_obj_ids) == len(existing_masklet_binary)
         for obj_id, mask in zip(existing_masklet_obj_ids, existing_masklet_binary):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
@@ -1218,7 +1222,7 @@ class Sam3VideoBase(nn.Module):
             align_corners=False,
         )  # (num_obj, 1, H_video, W_video)
 
-        new_masklet_binary = new_masklet_video_res_masks > 0
+        new_masklet_binary = new_masklet_video_res_masks > MASK_LOGIT_THRESHOLD
         assert len(new_det_obj_ids) == len(new_masklet_video_res_masks)
         for obj_id, mask in zip(new_det_obj_ids, new_masklet_binary):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)

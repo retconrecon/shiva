@@ -2,11 +2,26 @@
 
 # pyre-unsafe
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from numpy.typing import NDArray
 from sam3.model.edt import edt_triton
+
+# SHIVA_MASK_THRESHOLD: logit threshold for binarizing video-resolution mask logits at the OUTPUT
+# seam. Canonical definition lives HERE (the leaf module every consumer already imports) after
+# exp040b proved the first placement wrong: defining it in sam3_video_inference.py and editing the
+# six `> 0.0` sites there and in sam3_multiplex_tracking.py produced a BYTE-IDENTICAL mgz
+# (fd5e6da1...) to threshold-0.0, because the live multiplex path binarizes in
+# sam3_multiplex_base._postprocess_masks-era code (`existing_masklet_binary = ... > 0`, bare int
+# literal) which that grep never matched. The content hash was the counter-evidence; the fix is to
+# define once at the leaf and consume at EVERY output-seam producer. Association/matching internals
+# (det-vs-trk IoU, agreement checks, memory suppression) deliberately stay at `> 0`: this knob
+# widens what we EMIT, never how objects are matched. Read once at import so torch.compile sees a
+# constant; 0.0 (default) is arithmetically identical to upstream.
+MASK_LOGIT_THRESHOLD = float(os.environ.get("SHIVA_MASK_THRESHOLD", "0.0"))
 
 
 def sample_box_points(

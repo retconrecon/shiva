@@ -27,14 +27,11 @@ from tqdm.auto import tqdm
 
 logger = get_logger(__name__)
 
-# SHIVA_MASK_THRESHOLD: logit threshold for binarizing video-resolution mask logits at the OUTPUT
-# seam (every `> threshold` emit site in this file and sam3_multiplex_tracking.py). Upstream
-# hardcodes 0.0. Thin extremities live in the low-|logit| band and are the first pixels lost at
-# 0.0 (measured on sa_fari_000702/exp036: a 3-7 px tail sliver, absent from 4 frames, moved
-# box-IoU 0.98 -> 0.41); a small negative value recovers that band at zero compute. Read once at
-# import so the value is a compile-time constant; 0.0 (the default) is arithmetically identical
-# to upstream, so an unset env var cannot change behavior.
-MASK_LOGIT_THRESHOLD = float(os.environ.get("SHIVA_MASK_THRESHOLD", "0.0"))
+# SHIVA_MASK_THRESHOLD: canonical definition moved to sam3_tracker_utils (the leaf module) after
+# exp040b proved this file's sites are not on the live multiplex emit path. Re-exported here so
+# existing importers (sam3_multiplex_tracking, the ZEUS node's capability gate) keep working.
+from sam3.model.sam3_tracker_utils import MASK_LOGIT_THRESHOLD  # noqa: E402
+
 if MASK_LOGIT_THRESHOLD != 0.0:
     logger.info(
         f"SHIVA_MASK_THRESHOLD active: output masks binarize at logit > {MASK_LOGIT_THRESHOLD}"
