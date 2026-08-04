@@ -112,6 +112,34 @@ if arity != [3]:
     fails.append(f"track() yield arity {arity}, expected [3]")
 print(f"4. track() yield arity: {arity}")
 
+# 4b. track()'s own KEYWORD NAMES match what ZEUS passes.
+# Check 3 covers ShivaTracker.__init__ params; nothing covered track()'s signature, so
+# ZEUS_BIDIRECTIONAL passed `start_frame_idx` (SAM2's spelling, correct in the SAM2 call sites)
+# to a tracker whose parameter is `start_frame_index`. The flag therefore raised TypeError on
+# EVERY fork SHA and could never have run. Found 2026-08-03 by burning a pod (exp090); the
+# tracker crashed on the first call, salvage kept zero frames, and the never-bill guard refused
+# to emit. A name mismatch is exactly the drift this file exists to catch.
+track_params = set(inspect.signature(ShivaTracker.track).parameters) - {"self"}
+ALWAYS = {"n_frames", "propagation_direction"}          # passed on every run
+GATED = {"start_frame_index"}                            # passed only under ZEUS_BIDIRECTIONAL=1
+missing_always = ALWAYS - track_params
+if missing_always:
+    fails.append(f"track() missing kwargs ZEUS ALWAYS passes: {sorted(missing_always)}")
+# A gated kwarg being absent means the flag is unavailable on this branch - a warning, not a
+# break. A NEAR-MISS name is fatal: it means the flag will raise TypeError at runtime while
+# looking correct in review, which is precisely how this bug survived.
+for want in sorted(GATED):
+    if want in track_params:
+        continue
+    near = [p for p in track_params if p.replace("_idx", "_index") == want
+            or p.replace("_index", "_idx") == want or (p.startswith("start_frame") and p != want)]
+    if near:
+        fails.append(f"track() has {near} but ZEUS passes {want!r} - name mismatch, "
+                     f"raises TypeError at runtime")
+    else:
+        print(f"4b. NOTE: track() has no {want!r}; ZEUS_BIDIRECTIONAL unavailable on this branch")
+print(f"4b. track() params: {sorted(track_params)}")
+
 # 5. Removed features leave no attribute-planting behind.
 tracker_src = (REPO / "sam3/model/shiva_tracker.py").read_text()
 for marker in ["_shiva_sentinel_status", "_tiab_", "_shiva_map_prior",
